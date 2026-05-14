@@ -217,12 +217,15 @@ def plot_lines(
     *,
     log_y: bool = True,
     y_quantity_label: str = "Resistance",
+    log_y_use_abs_y: bool = False,
 ) -> go.Figure:
     x_series, x_title = prepare_x_axis(df, x_col)
     fig = go.Figure()
     for name in y_cols:
         y_raw = df[name]
         y_series = y_raw if pd.api.types.is_numeric_dtype(y_raw) else pd.to_numeric(y_raw, errors="coerce")
+        if log_y and log_y_use_abs_y:
+            y_series = y_series.abs()
         fig.add_trace(
             go.Scatter(
                 x=x_series,
@@ -232,7 +235,12 @@ def plot_lines(
                 connectgaps=False,
             )
         )
-    yaxis_title = f"{y_quantity_label} (log scale)" if log_y else y_quantity_label
+    if log_y and log_y_use_abs_y:
+        yaxis_title = f"|{y_quantity_label}| (log scale)"
+    elif log_y:
+        yaxis_title = f"{y_quantity_label} (log scale)"
+    else:
+        yaxis_title = y_quantity_label
     fig.update_layout(
         margin=dict(l=40, r=24, t=48, b=40),
         legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
@@ -277,6 +285,7 @@ class WideCsvViewConfig:
     log_checkbox_help: str | None
     crossbar_example: str
     trace_kind_tip: str
+    log_y_use_abs_y: bool = False
 
 
 RETENTION_VIEW = WideCsvViewConfig(
@@ -326,12 +335,13 @@ IV_VIEW = WideCsvViewConfig(
     log_y_default=False,
     y_quantity_label="Current",
     non_positive_log_warning=(
-        "Some selected current values are **≤ 0**; they cannot be shown on a log axis "
-        "and may disappear. Turn off **Logarithmic current (Y)** in the sidebar to see them."
+        "Some selected currents are **exactly zero**; log scale cannot display them and they may disappear. "
+        "Turn off **Logarithmic current (Y)** to see signed current including zeros."
     ),
-    log_checkbox_help="Useful when currents span many orders of magnitude.",
+    log_checkbox_help="Log Y plots **|current|** so positive and negative branches are visible.",
     crossbar_example="I3:0(A)",
     trace_kind_tip="current",
+    log_y_use_abs_y=True,
 )
 
 
@@ -552,24 +562,41 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
         bad = False
         for col in selected:
             s = pd.to_numeric(df[col], errors="coerce")
-            if s.notna().any() and (s.dropna() <= 0).any():
-                bad = True
-                break
+            if cfg.log_y_use_abs_y:
+                s_plot = s.abs()
+                if s_plot.notna().any() and (s_plot.dropna() == 0).any():
+                    bad = True
+                    break
+            else:
+                if s.notna().any() and (s.dropna() <= 0).any():
+                    bad = True
+                    break
         if bad:
             st.warning(cfg.non_positive_log_warning)
 
-    fig = plot_lines(df, x_col, selected, log_y=log_y_axis, y_quantity_label=cfg.y_quantity_label)
+    fig = plot_lines(
+        df,
+        x_col,
+        selected,
+        log_y=log_y_axis,
+        y_quantity_label=cfg.y_quantity_label,
+        log_y_use_abs_y=cfg.log_y_use_abs_y,
+    )
     st.plotly_chart(fig, use_container_width=True)
     if log_y_axis:
         y_flat: list[float] = []
         for c in selected:
             s = pd.to_numeric(df[c], errors="coerce").dropna()
+            if cfg.log_y_use_abs_y:
+                s = s.abs()
             y_flat.extend(float(x) for x in s if float(x) > 0)
         if y_flat:
             ymin, ymax = min(y_flat), max(y_flat)
             ratio = ymax / ymin
+            abs_note = "Plotted Y is **|current|**. " if cfg.log_y_use_abs_y else ""
             st.caption(
-                f"**Y is logarithmic (base 10).** Selected positive values span about **×{ratio:.2f}** "
+                f"**Y is logarithmic (base 10).** {abs_note}"
+                f"Selected positive values span about **×{ratio:.2f}** "
                 f"({ymin:.2e} … {ymax:.2e}). If that ratio is small, curves look almost like a linear axis; "
                 f"the Y grid is still **multiplicative** (see power-of-10 ticks)."
             )
