@@ -25,6 +25,30 @@ If your shell says `cd: no such file or directory: resistance-retention-viewer`,
 
 ## Run
 
+### macOS — double-click only (no Terminal window)
+
+**Double-click `Resistance Viewer.app`** in the project folder. That is the only step for normal use.
+
+- In **Finder** you see a single app icon — not a `Contents` folder. That is correct: a `.app` is one **bundle** (a special folder macOS shows as one application). The launcher scripts live inside it; right-click the app → **Show Package Contents** if you ever need to inspect `Contents/MacOS` or `Contents/Resources`.
+- After **clone or pull**, run once from Terminal: `./scripts/register_app.sh` (copies the latest `src/` into the `.app` bundle — required because macOS sandbox blocks the app from reading arbitrary folders on double-click).
+- You can keep **`Resistance Viewer.app` anywhere** once registered; the runnable code lives inside the bundle under `Contents/Resources/app/`.
+- No Terminal window opens; Streamlit runs in the background (you may see a **Python** icon in the Dock while it is running).
+- Your browser opens automatically at `http://127.0.0.1:8501` when the server is ready.
+- **First run** creates a virtual environment under `~/Library/Application Support/Resistance Viewer/venvs/` (not in the project folder), installs dependencies, and can take a few minutes (macOS notifications; details in `~/Library/Logs/Resistance Viewer/viewer.log`).
+- If the viewer is already running, double-clicking again only reopens the browser.
+- **Quit**: stop the app from the Dock (right-click the Python icon → Quit), or end the Streamlit process in Activity Monitor.
+
+**If double-click does nothing** (common on first use):
+
+1. Right-click **`Resistance Viewer.app`** → **Open** → confirm **Open** (macOS may block unsigned local apps silently).
+2. Or run once: `./scripts/register_app.sh` (clears quarantine and ad-hoc signs the app).
+
+**Troubleshooting:** Check `~/Library/Logs/Resistance Viewer/app-launch.log` (did the app start?) and `viewer.log` (Streamlit). Stop any old server on port 8501 (`lsof -i :8501`) if a previous session is still running.
+
+If you see **“Still starting…”** or a browser timeout notification, that is usually harmless: Streamlit can take a minute on a cold start while Python loads. The app keeps trying to open the browser for several minutes; you can also open `http://127.0.0.1:8501` yourself once the Dock shows Python running.
+
+### Command line
+
 With the virtual environment activated:
 
 ```bash
@@ -34,6 +58,12 @@ python3 -m streamlit run src/resistance_viewer/app.py
 If `streamlit` works after install, `streamlit run src/resistance_viewer/app.py` is equivalent.
 
 Open the URL shown in the terminal (usually `http://localhost:8501`).
+
+You can also run the same launcher script without the `.app` bundle:
+
+```bash
+./scripts/launch_viewer.sh
+```
 
 ## CSV format
 

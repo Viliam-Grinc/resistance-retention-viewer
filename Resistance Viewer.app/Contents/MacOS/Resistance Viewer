@@ -1,0 +1,13 @@
+#!/bin/bash
+# Finder launches this directly (no Terminal). Do not use "do shell script" — it blocks Documents/.venv.
+set -u
+
+LOG_DIR="${HOME}/Library/Logs/Resistance Viewer"
+LOG_FILE="${LOG_DIR}/app-launch.log"
+mkdir -p "${LOG_DIR}"
+
+{
+  printf '\n---- %s ----\n' "$(date)"
+  RESOURCES="$(cd "$(dirname "$0")/../Resources" && pwd)"
+  exec /bin/bash "${RESOURCES}/launch.sh"
+} >>"${LOG_FILE}" 2>&1
