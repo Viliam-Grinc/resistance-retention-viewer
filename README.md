@@ -94,10 +94,11 @@ Time(s);G3:0(S);G4:0(S)
 
 ## UI behavior
 
+- **Layout:** **Sidebar** = upload and all setup (unchanged). **Main area** = left: 16×16 crossbar (when enabled) and **Data preview**; right: **chart only**. Use **Chart panel width (%)** above the main area to resize the plot column.
 - Upload a `.csv` file.
 - Choose the **X axis** column in the sidebar.
 - **Logarithmic resistance (Y)** is on by default. The axis uses **base-10 log** (tick spacing is multiplicative). If all traces sit in a **narrow factor range** (e.g. only ×1.2 from min to max), the lines can **look almost like a linear plot**—check the power-of-10 style Y labels. Turn log off for a strictly linear axis, or if you have **zero or negative** values in the selection.
-- **16×16 crossbar**: If trace columns match `G<row>:<col>(…)` with **row** and **col** in `0…15` (e.g. `G3:0(S)` → row 3, column 0), the sidebar enables **Pick devices on 16×16 crossbar**. The **main area** shows a **16×16 grid** of checkboxes: **horizontal axis = row**, **vertical axis = column** (matching how many crossbar diagrams are drawn). A dot means that cell is not present in the file. Use **Crossbar: all in file** / **Crossbar: clear** in the sidebar. Traces that do not match the pattern appear under **Traces without crossbar coordinates** in the sidebar.
+- **16×16 crossbar**: If trace columns match `G<row>:<col>(…)` with **row** and **col** in `0…15` (e.g. `G3:0(S)` → row 3, column 0), the sidebar enables **Pick devices on 16×16 crossbar**. The **left main column** shows a **16×16 grid** of checkboxes: **horizontal axis = row**, **vertical axis = column** (matching how many crossbar diagrams are drawn). A dot means that cell is not present in the file. Use **Crossbar: all in file** / **Crossbar: clear** in the sidebar. Traces that do not match the pattern appear under **Traces without crossbar coordinates** in the sidebar.
 - If you turn off the crossbar picker (or names do not match), series are chosen the classic way:
   - **20 or fewer** numeric series: **one checkbox per series**, plus **Select all** / **Clear**.
   - **More than 20**: **multiselect** with the same buttons.

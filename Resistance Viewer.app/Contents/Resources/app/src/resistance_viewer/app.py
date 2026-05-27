@@ -243,7 +243,7 @@ def plot_lines(
         yaxis_title = y_quantity_label
     fig.update_layout(
         margin=dict(l=40, r=24, t=48, b=40),
-        legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
+        legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=0.99),
         xaxis_title=x_title,
         yaxis_title=yaxis_title,
         hovermode="x unified",
@@ -500,7 +500,7 @@ def _wide_csv_sidebar_controls(cfg: WideCsvViewConfig) -> None:
 
 
 def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
-    """Full-width main area: optional 16×16 crossbar grid, then chart (same flow as retention README)."""
+    """Main area: left = crossbar + data preview; right = chart (sidebar unchanged)."""
     wp = cfg.wp
     if cfg.df_key not in st.session_state:
         st.info(cfg.empty_info)
@@ -525,19 +525,11 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
     chk_prefix = f"{wp}_chk_{ns}_"
     use_checkboxes = len(y_cols) <= 20
     grid_map = crossbar_column_map(y_cols)
-    if wp == "iv" and y_cols and not grid_map:
-        st.info(
-            "No **16×16 crossbar** column names were found. Expected patterns like `I3:0(A)`, `G3:0(I)`, or hyphen forms "
-            "(row and column 0–15; **I** = per-cell current, **G** = conductance/state). Use the **sidebar** multiselect or per-series checkboxes."
-        )
     other_y = [c for c in y_cols if c not in set(grid_map.values())]
     other_key = f"{wp}_other_series_{ns}"
     sel_key = f"{wp}_series_multiselect_{ns}"
 
     use_grid_ui = bool(st.session_state.get(f"{wp}_use_crossbar_grid_{ns}", True)) if grid_map else False
-
-    if grid_map and use_grid_ui:
-        render_crossbar_checkbox_grid(grid_map, wp=wp, ns=ns)
 
     selected: list[str] = []
     if grid_map and use_grid_ui:
@@ -554,55 +546,79 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
     else:
         selected = [x for x in st.session_state.get(sel_key, []) if x in y_cols]
 
-    if not selected:
-        st.warning("Select at least one series to plot.")
-        return
-
-    if log_y_axis:
-        bad = False
-        for col in selected:
-            s = pd.to_numeric(df[col], errors="coerce")
-            if cfg.log_y_use_abs_y:
-                s_plot = s.abs()
-                if s_plot.notna().any() and (s_plot.dropna() == 0).any():
-                    bad = True
-                    break
-            else:
-                if s.notna().any() and (s.dropna() <= 0).any():
-                    bad = True
-                    break
-        if bad:
-            st.warning(cfg.non_positive_log_warning)
-
-    fig = plot_lines(
-        df,
-        x_col,
-        selected,
-        log_y=log_y_axis,
-        y_quantity_label=cfg.y_quantity_label,
-        log_y_use_abs_y=cfg.log_y_use_abs_y,
+    chart_pct = st.slider(
+        "Chart panel width (%)",
+        min_value=35,
+        max_value=75,
+        value=55,
+        key=f"{wp}_chart_col_pct",
+        help="Adjust how much horizontal space the plot uses (remainder = crossbar and data preview).",
     )
-    st.plotly_chart(fig, use_container_width=True)
-    if log_y_axis:
-        y_flat: list[float] = []
-        for c in selected:
-            s = pd.to_numeric(df[c], errors="coerce").dropna()
-            if cfg.log_y_use_abs_y:
-                s = s.abs()
-            y_flat.extend(float(x) for x in s if float(x) > 0)
-        if y_flat:
-            ymin, ymax = min(y_flat), max(y_flat)
-            ratio = ymax / ymin
-            abs_note = "Plotted Y is **|current|**. " if cfg.log_y_use_abs_y else ""
-            st.caption(
-                f"**Y is logarithmic (base 10).** {abs_note}"
-                f"Selected positive values span about **×{ratio:.2f}** "
-                f"({ymin:.2e} … {ymax:.2e}). If that ratio is small, curves look almost like a linear axis; "
-                f"the Y grid is still **multiplicative** (see power-of-10 ticks)."
+    left_w = 100 - chart_pct
+    left_col, chart_col = st.columns([left_w, chart_pct])
+
+    with left_col:
+        if wp == "iv" and y_cols and not grid_map:
+            st.info(
+                "No **16×16 crossbar** column names were found. Expected patterns like `I3:0(A)`, `G3:0(I)`, or hyphen forms "
+                "(row and column 0–15; **I** = per-cell current, **G** = conductance/state). Use the **sidebar** multiselect or per-series checkboxes."
             )
 
-    with st.expander("Data preview"):
-        st.dataframe(df.head(50), use_container_width=True)
+        if grid_map and use_grid_ui:
+            render_crossbar_checkbox_grid(grid_map, wp=wp, ns=ns)
+
+        if not selected:
+            st.warning("Select at least one series to plot.")
+
+        with st.expander("Data preview"):
+            st.dataframe(df.head(50), use_container_width=True)
+
+    with chart_col:
+        if not selected:
+            return
+
+        if log_y_axis:
+            bad = False
+            for col in selected:
+                s = pd.to_numeric(df[col], errors="coerce")
+                if cfg.log_y_use_abs_y:
+                    s_plot = s.abs()
+                    if s_plot.notna().any() and (s_plot.dropna() == 0).any():
+                        bad = True
+                        break
+                else:
+                    if s.notna().any() and (s.dropna() <= 0).any():
+                        bad = True
+                        break
+            if bad:
+                st.warning(cfg.non_positive_log_warning)
+
+        fig = plot_lines(
+            df,
+            x_col,
+            selected,
+            log_y=log_y_axis,
+            y_quantity_label=cfg.y_quantity_label,
+            log_y_use_abs_y=cfg.log_y_use_abs_y,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        if log_y_axis:
+            y_flat: list[float] = []
+            for c in selected:
+                s = pd.to_numeric(df[c], errors="coerce").dropna()
+                if cfg.log_y_use_abs_y:
+                    s = s.abs()
+                y_flat.extend(float(x) for x in s if float(x) > 0)
+            if y_flat:
+                ymin, ymax = min(y_flat), max(y_flat)
+                ratio = ymax / ymin
+                abs_note = "Plotted Y is **|current|**. " if cfg.log_y_use_abs_y else ""
+                st.caption(
+                    f"**Y is logarithmic (base 10).** {abs_note}"
+                    f"Selected positive values span about **×{ratio:.2f}** "
+                    f"({ymin:.2e} … {ymax:.2e}). If that ratio is small, curves look almost like a linear axis; "
+                    f"the Y grid is still **multiplicative** (see power-of-10 ticks)."
+                )
 
 
 def main() -> None:
