@@ -10,6 +10,7 @@ from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.colors import qualitative
 import streamlit as st
 
 # Crossbar: ``G3:0(S)`` (conductance / state) or ``I3:0(A)`` / ``I3-0(A)`` (per-cell current) → row 3, col 0.
@@ -221,6 +222,56 @@ def relative_to_first_valid_percent(series: pd.Series[Any]) -> pd.Series[Any]:
     return (num / ref) * 100.0
 
 
+def first_valid_numeric_value(series: pd.Series[Any]) -> float | None:
+    """Return first numeric value in ``series``; ``None`` when unavailable."""
+    num = pd.to_numeric(series, errors="coerce")
+    first = num.first_valid_index()
+    if first is None:
+        return None
+    return float(num.loc[first])
+
+
+def percent_difference(a: float, b: float) -> float:
+    """Symmetric percent difference between two start values."""
+    denom = max(abs(a), abs(b), 1e-15)
+    return abs(a - b) / denom * 100.0
+
+
+def close_start_groups(
+    df: pd.DataFrame,
+    traces: list[str],
+    *,
+    threshold_percent: float,
+) -> dict[str, int]:
+    """
+    Group traces with close first points.
+
+    Implementation: sort by first valid value and split when adjacent percent jump exceeds threshold.
+    """
+    starts: list[tuple[str, float]] = []
+    for name in traces:
+        v = first_valid_numeric_value(df[name])
+        if v is None:
+            continue
+        starts.append((name, v))
+
+    if not starts:
+        return {}
+
+    starts.sort(key=lambda it: it[1])
+    group_map: dict[str, int] = {}
+    group_id = 0
+    prev = starts[0][1]
+    group_map[starts[0][0]] = group_id
+
+    for name, value in starts[1:]:
+        if percent_difference(prev, value) > threshold_percent:
+            group_id += 1
+        group_map[name] = group_id
+        prev = value
+    return group_map
+
+
 def prepare_x_axis(df: pd.DataFrame, x_col: str) -> tuple[pd.Series[Any], str]:
     """Return values for Plotly x and a label for the axis.
 
@@ -263,6 +314,7 @@ def plot_lines(
     log_y: bool = True,
     y_quantity_label: str = "Resistance",
     log_y_use_abs_y: bool = False,
+    trace_color_map: dict[str, str] | None = None,
 ) -> go.Figure:
     x_series, x_title = prepare_x_axis(df, x_col)
     fig = go.Figure()
@@ -278,6 +330,7 @@ def plot_lines(
                 mode="lines",
                 name=name,
                 connectgaps=False,
+                line=dict(color=trace_color_map[name]) if trace_color_map and name in trace_color_map else None,
             )
         )
     if log_y and log_y_use_abs_y:
@@ -644,6 +697,24 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
             key=f"{wp}_only_last_{ns}",
         )
         plot_selected = selected[-1:] if only_last else selected
+        color_close_starts = False
+        close_threshold = 10
+        if wp == "ret":
+            color_close_starts = st.toggle(
+                "Color traces by close start values",
+                value=False,
+                key=f"{wp}_color_close_starts_{ns}",
+            )
+            if color_close_starts:
+                close_threshold = st.slider(
+                    "Close-start threshold (%)",
+                    min_value=1,
+                    max_value=50,
+                    value=10,
+                    key=f"{wp}_close_start_threshold_{ns}",
+                    help="Traces whose first valid values differ by <= threshold% are colored together.",
+                )
+
         relative_retention = bool(st.session_state.get(f"{wp}_relative_retention_{ns}", False)) if wp == "ret" else False
         plot_df = df
         y_label = cfg.y_quantity_label
@@ -652,6 +723,46 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
             for col in plot_selected:
                 plot_df[col] = relative_to_first_valid_percent(df[col])
             y_label = "Retention (%)"
+
+        trace_color_map: dict[str, str] | None = None
+        groups: dict[str, int] = {}
+        if color_close_starts:
+            groups = close_start_groups(df, plot_selected, threshold_percent=float(close_threshold))
+            palette = qualitative.Plotly
+            trace_color_map = {}
+            for name in plot_selected:
+                gid = groups.get(name)
+                if gid is None:
+                    continue
+                trace_color_map[name] = palette[gid % len(palette)]
+            if groups:
+                st.caption(f"Close-start groups: **{len(set(groups.values()))}** at threshold **{close_threshold}%**.")
+                ordered_group_ids = sorted(set(groups.values()))
+                group_labels = [f"Group {gid + 1}" for gid in ordered_group_ids]
+                group_label_to_id = {label: gid for label, gid in zip(group_labels, ordered_group_ids, strict=False)}
+                groups_key = f"{wp}_picked_groups_{ns}"
+                current = st.session_state.get(groups_key, group_labels)
+                valid = [g for g in current if g in group_labels]
+                if not valid:
+                    valid = group_labels
+                st.session_state[groups_key] = valid
+                picked_labels = st.multiselect(
+                    "Show groups",
+                    options=group_labels,
+                    key=groups_key,
+                    help="Pick which close-start groups to display.",
+                )
+                picked_ids = {group_label_to_id[g] for g in picked_labels}
+                if picked_ids:
+                    plot_selected = [name for name in plot_selected if groups.get(name) in picked_ids]
+                else:
+                    plot_selected = []
+                if trace_color_map is not None:
+                    trace_color_map = {name: color for name, color in trace_color_map.items() if name in set(plot_selected)}
+
+        if not plot_selected:
+            st.warning("No traces left after group filtering.")
+            return
 
         if log_y_axis:
             bad = False
@@ -682,6 +793,7 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
             log_y=log_y_axis,
             y_quantity_label=y_label,
             log_y_use_abs_y=cfg.log_y_use_abs_y,
+            trace_color_map=trace_color_map,
         )
         st.plotly_chart(fig, use_container_width=True)
         if log_y_axis:
