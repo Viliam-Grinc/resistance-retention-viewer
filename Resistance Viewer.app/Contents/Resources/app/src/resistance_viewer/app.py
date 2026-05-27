@@ -275,7 +275,16 @@ def plot_lines(
         yaxis_title = y_quantity_label
     fig.update_layout(
         margin=dict(l=40, r=24, t=48, b=40),
-        legend=dict(orientation="v", yanchor="top", y=1, xanchor="right", x=0.99),
+        legend=dict(
+            orientation="v",
+            yanchor="top",
+            y=1,
+            xanchor="right",
+            x=0.99,
+            # Plotly default is "toggleothers" on double-click; disable that
+            # so users don't accidentally isolate a single trace.
+            itemdoubleclick="toggle",
+        ),
         xaxis_title=x_title,
         yaxis_title=yaxis_title,
         hovermode="x unified",
@@ -609,9 +618,16 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
         if not selected:
             return
 
+        only_last = st.toggle(
+            "Only show last selected trace",
+            value=False,
+            key=f"{wp}_only_last_{ns}",
+        )
+        plot_selected = selected[-1:] if only_last else selected
+
         if log_y_axis:
             bad = False
-            for col in selected:
+            for col in plot_selected:
                 s = pd.to_numeric(df[col], errors="coerce")
                 if cfg.log_y_use_abs_y:
                     s_plot = s.abs()
@@ -628,7 +644,7 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
         fig = plot_lines(
             df,
             x_col,
-            selected,
+            plot_selected,
             log_y=log_y_axis,
             y_quantity_label=cfg.y_quantity_label,
             log_y_use_abs_y=cfg.log_y_use_abs_y,
@@ -636,7 +652,7 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
         st.plotly_chart(fig, use_container_width=True)
         if log_y_axis:
             y_flat: list[float] = []
-            for c in selected:
+            for c in plot_selected:
                 s = pd.to_numeric(df[c], errors="coerce").dropna()
                 if cfg.log_y_use_abs_y:
                     s = s.abs()
