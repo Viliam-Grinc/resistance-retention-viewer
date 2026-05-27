@@ -69,7 +69,7 @@ You can also run the same launcher script without the `.app` bundle:
 
 - **Wide table**: one X column (usually time) and **one column per device / trace**.
 - **Delimiter**: **Comma or semicolon** (`;`). Instrument exports (e.g. crossbar retention tests) often use **semicolon-separated** fields.
-- **Numbers**: Plain decimals or **scientific notation** (e.g. `1.7560827E-06`) are supported.
+- **Numbers**: Plain decimals or **scientific notation** (e.g. `1.7560827E-06`). **European decimal comma** is supported when fields are separated by `;` (e.g. `0,1` and `1,5789465E-07`).
 - **X axis**: The app prefers columns named like `Time(s)`, `time`, `timestamp`, `date`, or `t` (case-insensitive, including names that start with `time(`); otherwise it defaults to the **first** column.
 - **Time values**: Columns that are mostly **numbers** are plotted on a **numeric** X axis (e.g. elapsed **seconds** `0, 900, 1800`). Large values (`>1e9` seconds or `>1e12` ms) are treated as **Unix timestamps** and shown as datetimes. Text columns that parse as dates use a datetime axis.
 - **Trailing delimiter**: A stray `;` at the end of a line (empty last column) is dropped when it contains no data.

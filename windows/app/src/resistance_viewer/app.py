@@ -91,22 +91,50 @@ def crossbar_column_map(y_columns: list[str]) -> dict[tuple[int, int], str]:
     return d
 
 
+def _fraction_numeric_cells(df: pd.DataFrame, *, max_cols: int = 8, max_rows: int = 100) -> float:
+    """Share of non-empty cells that are already numeric (after read_csv decimal=…)."""
+    if df.empty or len(df.columns) < 1:
+        return 0.0
+    total = 0
+    numeric = 0
+    for col in list(df.columns)[:max_cols]:
+        for v in df[col].head(max_rows):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                continue
+            if isinstance(v, str) and not str(v).strip():
+                continue
+            total += 1
+            if isinstance(v, (int, float)):
+                numeric += 1
+    return numeric / total if total else 0.0
+
+
 def read_csv_bytes(raw: bytes) -> pd.DataFrame:
     """
     Load instrument-style CSV: comma or semicolon separated, scientific notation (e.g. 1.76E-06).
 
-    Picks the parse with the most columns so a wrong delimiter (one fat column) loses.
+    Supports European decimal comma (e.g. ``0,1`` and ``1,5789465E-07``) when ``;`` separates fields.
+    Picks delimiter and decimal by column count and how many values parse as numbers.
     """
     text = _decode_csv_text(raw)
-    read_kw: list[dict[str, Any]] = [
-        {"sep": None, "engine": "python"},
-        {"sep": ";", "engine": "python"},
-        {"sep": ",", "engine": "python"},
+    # (sep, decimal_char) — skip (",", ","): delimiter and decimal would both be comma.
+    parse_attempts: list[tuple[str | None, str]] = [
+        (None, "."),
+        (None, ","),
+        (";", "."),
+        (";", ","),
+        (",", "."),
     ]
     best: pd.DataFrame | None = None
-    best_n = 0
+    best_key = (-1, -1.0)  # (num_columns, numeric_fraction)
     last_exc: Exception | None = None
-    for kw in read_kw:
+
+    for sep, decimal in parse_attempts:
+        kw: dict[str, Any] = {"engine": "python", "decimal": decimal}
+        if sep is not None:
+            kw["sep"] = sep
+        else:
+            kw["sep"] = None
         try:
             df = pd.read_csv(io.StringIO(text), **kw)
         except Exception as exc:  # noqa: BLE001
@@ -114,10 +142,14 @@ def read_csv_bytes(raw: bytes) -> pd.DataFrame:
             continue
         df = cleanup_df(df)
         n = len(df.columns)
-        if n > best_n:
+        if n < 1:
+            continue
+        key = (n, _fraction_numeric_cells(df))
+        if key > best_key:
             best = df
-            best_n = n
-    if best is None or best_n < 1:
+            best_key = key
+
+    if best is None or best_key[0] < 1:
         raise ValueError(last_exc or "Could not parse CSV")
     return best
 
