@@ -208,6 +208,19 @@ def numeric_y_columns(df: pd.DataFrame, x_col: str) -> list[str]:
     return out
 
 
+def relative_to_first_valid_percent(series: pd.Series[Any]) -> pd.Series[Any]:
+    """Normalize a trace to its first valid point (100%)."""
+    num = pd.to_numeric(series, errors="coerce")
+    first = num.first_valid_index()
+    if first is None:
+        return num
+    ref = float(num.loc[first])
+    if ref == 0:
+        # Relative normalization is undefined for zero baseline.
+        return pd.Series(float("nan"), index=num.index)
+    return (num / ref) * 100.0
+
+
 def prepare_x_axis(df: pd.DataFrame, x_col: str) -> tuple[pd.Series[Any], str]:
     """Return values for Plotly x and a label for the axis.
 
@@ -441,6 +454,13 @@ def _wide_csv_sidebar_controls(cfg: WideCsvViewConfig) -> None:
         key=f"{wp}_log_y_{chk_ns}",
         help=cfg.log_checkbox_help,
     )
+    if wp == "ret":
+        st.checkbox(
+            "Relative retention (%)",
+            value=False,
+            key=f"{wp}_relative_retention_{chk_ns}",
+            help="Normalize each selected retention trace to its first valid value = 100%.",
+        )
 
     x_col = str(st.session_state[xa_key])
     y_cols = numeric_y_columns(df, x_col)
@@ -624,11 +644,19 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
             key=f"{wp}_only_last_{ns}",
         )
         plot_selected = selected[-1:] if only_last else selected
+        relative_retention = bool(st.session_state.get(f"{wp}_relative_retention_{ns}", False)) if wp == "ret" else False
+        plot_df = df
+        y_label = cfg.y_quantity_label
+        if relative_retention:
+            plot_df = df.copy()
+            for col in plot_selected:
+                plot_df[col] = relative_to_first_valid_percent(df[col])
+            y_label = "Retention (%)"
 
         if log_y_axis:
             bad = False
             for col in plot_selected:
-                s = pd.to_numeric(df[col], errors="coerce")
+                s = pd.to_numeric(plot_df[col], errors="coerce")
                 if cfg.log_y_use_abs_y:
                     s_plot = s.abs()
                     if s_plot.notna().any() and (s_plot.dropna() == 0).any():
@@ -639,21 +667,27 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
                         bad = True
                         break
             if bad:
-                st.warning(cfg.non_positive_log_warning)
+                if relative_retention:
+                    st.warning(
+                        "Some selected relative retention values are **≤ 0**; they cannot be shown on a log axis "
+                        "and may disappear. Turn off logarithmic Y to see them."
+                    )
+                else:
+                    st.warning(cfg.non_positive_log_warning)
 
         fig = plot_lines(
-            df,
+            plot_df,
             x_col,
             plot_selected,
             log_y=log_y_axis,
-            y_quantity_label=cfg.y_quantity_label,
+            y_quantity_label=y_label,
             log_y_use_abs_y=cfg.log_y_use_abs_y,
         )
         st.plotly_chart(fig, use_container_width=True)
         if log_y_axis:
             y_flat: list[float] = []
             for c in plot_selected:
-                s = pd.to_numeric(df[c], errors="coerce").dropna()
+                s = pd.to_numeric(plot_df[c], errors="coerce").dropna()
                 if cfg.log_y_use_abs_y:
                     s = s.abs()
                 y_flat.extend(float(x) for x in s if float(x) > 0)
