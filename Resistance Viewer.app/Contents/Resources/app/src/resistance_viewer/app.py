@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import io
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+from math import comb
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.colors import qualitative
@@ -231,10 +234,48 @@ def first_valid_numeric_value(series: pd.Series[Any]) -> float | None:
     return float(num.loc[first])
 
 
+def last_valid_numeric_value(series: pd.Series[Any]) -> float | None:
+    """Return last numeric value in ``series``; ``None`` when unavailable."""
+    num = pd.to_numeric(series, errors="coerce")
+    last = num.last_valid_index()
+    if last is None:
+        return None
+    return float(num.loc[last])
+
+
 def percent_difference(a: float, b: float) -> float:
     """Symmetric percent difference between two start values."""
     denom = max(abs(a), abs(b), 1e-15)
     return abs(a - b) / denom * 100.0
+
+
+def close_value_groups(
+    values: dict[str, float],
+    *,
+    threshold_percent: float,
+) -> dict[str, int]:
+    """
+    Group named scalar values by closeness.
+
+    Implementation: sort by value and split into a new group when the adjacent percent jump
+    exceeds the threshold (see ``percent_difference``).
+    """
+    items = [(name, value) for name, value in values.items() if value is not None]
+    if not items:
+        return {}
+
+    items.sort(key=lambda it: it[1])
+    group_map: dict[str, int] = {}
+    group_id = 0
+    prev = items[0][1]
+    group_map[items[0][0]] = group_id
+
+    for name, value in items[1:]:
+        if percent_difference(prev, value) > threshold_percent:
+            group_id += 1
+        group_map[name] = group_id
+        prev = value
+    return group_map
 
 
 def close_start_groups(
@@ -248,28 +289,97 @@ def close_start_groups(
 
     Implementation: sort by first valid value and split when adjacent percent jump exceeds threshold.
     """
-    starts: list[tuple[str, float]] = []
+    values: dict[str, float] = {}
     for name in traces:
         v = first_valid_numeric_value(df[name])
         if v is None:
             continue
-        starts.append((name, v))
+        values[name] = v
+    return close_value_groups(values, threshold_percent=threshold_percent)
 
-    if not starts:
-        return {}
 
-    starts.sort(key=lambda it: it[1])
-    group_map: dict[str, int] = {}
-    group_id = 0
-    prev = starts[0][1]
-    group_map[starts[0][0]] = group_id
+def _interp_current_at(voltage: np.ndarray, current: np.ndarray, read_voltage: float) -> float | None:
+    """Current at ``read_voltage`` along a branch via linear interpolation (nearest point if out of range)."""
+    if voltage.size == 0:
+        return None
+    order = np.argsort(voltage)
+    v_sorted = voltage[order]
+    i_sorted = current[order]
+    if read_voltage < float(v_sorted[0]) or read_voltage > float(v_sorted[-1]):
+        nearest = int(np.argmin(np.abs(voltage - read_voltage)))
+        return float(current[nearest])
+    return float(np.interp(read_voltage, v_sorted, i_sorted))
 
-    for name, value in starts[1:]:
-        if percent_difference(prev, value) > threshold_percent:
-            group_id += 1
-        group_map[name] = group_id
-        prev = value
-    return group_map
+
+def iv_read_resistance(
+    voltage: Any,
+    current: Any,
+    *,
+    polarity: str,
+    read_voltage: float,
+) -> float | None:
+    """
+    Resistance read from the SET *return* branch at ``read_voltage``.
+
+    A sweep has a rising part (0 → ±Vmax) and a decreasing/return part (±Vmax → 0). The read is taken
+    on the **decreasing** branch within the chosen polarity region (the rising part is ignored):
+
+    - ``polarity == "positive"``: branch from the peak (max) voltage back toward 0, restricted to ``v >= 0``.
+    - ``polarity == "negative"``: branch from the trough (min) voltage back toward 0, restricted to ``v <= 0``.
+
+    Returns ``R = read_voltage / I(read_voltage)``; ``None`` when there is no usable branch point or ``I == 0``.
+    """
+    v = pd.to_numeric(pd.Series(voltage), errors="coerce").to_numpy(dtype=float)
+    i = pd.to_numeric(pd.Series(current), errors="coerce").to_numpy(dtype=float)
+    n = min(v.size, i.size)
+    v, i = v[:n], i[:n]
+    mask = ~(np.isnan(v) | np.isnan(i))
+    v, i = v[mask], i[mask]
+    if v.size < 2:
+        return None
+
+    if polarity == "positive":
+        peak_idx = int(np.argmax(v))
+        v_branch, i_branch = v[peak_idx:], i[peak_idx:]
+        region = v_branch >= 0
+    else:
+        peak_idx = int(np.argmin(v))
+        v_branch, i_branch = v[peak_idx:], i[peak_idx:]
+        region = v_branch <= 0
+
+    v_branch, i_branch = v_branch[region], i_branch[region]
+    if v_branch.size < 1:
+        return None
+
+    cur = _interp_current_at(v_branch, i_branch, read_voltage)
+    if cur is None or cur == 0:
+        return None
+    return read_voltage / cur
+
+
+def adjusted_rand_index(labels_a: list[int], labels_b: list[int]) -> float | None:
+    """Adjusted Rand Index between two cluster labelings (contingency-table formula); ``None`` if undefined."""
+    if len(labels_a) != len(labels_b) or not labels_a:
+        return None
+    n = len(labels_a)
+    contingency: dict[tuple[int, int], int] = {}
+    for la, lb in zip(labels_a, labels_b, strict=False):
+        contingency[(la, lb)] = contingency.get((la, lb), 0) + 1
+    a_counts = Counter(labels_a)
+    b_counts = Counter(labels_b)
+
+    sum_comb_cells = sum(comb(v, 2) for v in contingency.values())
+    sum_comb_a = sum(comb(v, 2) for v in a_counts.values())
+    sum_comb_b = sum(comb(v, 2) for v in b_counts.values())
+    total_comb = comb(n, 2)
+    if total_comb == 0:
+        return None
+    expected = sum_comb_a * sum_comb_b / total_comb
+    max_index = 0.5 * (sum_comb_a + sum_comb_b)
+    if max_index == expected:
+        # Both labelings are trivial (single cluster each); treat perfect agreement as 1.0.
+        return 1.0
+    return (sum_comb_cells - expected) / (max_index - expected)
 
 
 def is_conductance_column(column_name: str) -> bool:
@@ -366,6 +476,129 @@ def add_group_summary_overlays(
                 connectgaps=False,
             )
         )
+
+
+def _r_squared(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Coefficient of determination in the original (untransformed) y space."""
+    ss_res = float(np.nansum((y_true - y_pred) ** 2))
+    ss_tot = float(np.nansum((y_true - np.nanmean(y_true)) ** 2))
+    if ss_tot == 0:
+        return 1.0 if ss_res == 0 else 0.0
+    return 1.0 - ss_res / ss_tot
+
+
+def fit_retention_form(x: Any, y: Any) -> tuple[str, float, str]:
+    """
+    Best-fitting simple model of ``y(x)`` among constant/linear/logarithmic/exponential/power.
+
+    Returns ``(name, r_squared, formula)``. R² is always measured in the original y space so the
+    candidates are comparable. Log/power are only tried when ``x > 0`` everywhere; exponential/power
+    only when ``y > 0`` everywhere.
+    """
+    xa = np.asarray(x, dtype=float)
+    ya = np.asarray(y, dtype=float)
+    mask = np.isfinite(xa) & np.isfinite(ya)
+    xa, ya = xa[mask], ya[mask]
+    if xa.size < 3:
+        return ("n/a", float("nan"), "too few points")
+    order = np.argsort(xa)
+    xa, ya = xa[order], ya[order]
+
+    y_mean = float(np.mean(ya))
+    spread = float(np.max(ya) - np.min(ya))
+    if y_mean != 0 and spread / abs(y_mean) < 0.02:
+        return ("constant", 1.0, f"y \u2248 {y_mean:.3g}")
+
+    candidates: list[tuple[str, float, str]] = []
+    a, b = np.polyfit(xa, ya, 1)
+    candidates.append(("linear", _r_squared(ya, a * xa + b), f"y = {a:.3g}\u00b7x + {b:.3g}"))
+    if np.all(xa > 0):
+        a, b = np.polyfit(np.log(xa), ya, 1)
+        candidates.append(("logarithmic", _r_squared(ya, a * np.log(xa) + b), f"y = {a:.3g}\u00b7ln(x) + {b:.3g}"))
+    if np.all(ya > 0):
+        b, ln_a = np.polyfit(xa, np.log(ya), 1)
+        amp = float(np.exp(ln_a))
+        candidates.append(("exponential", _r_squared(ya, amp * np.exp(b * xa)), f"y = {amp:.3g}\u00b7e^({b:.3g}\u00b7x)"))
+    if np.all(xa > 0) and np.all(ya > 0):
+        b, ln_a = np.polyfit(np.log(xa), np.log(ya), 1)
+        amp = float(np.exp(ln_a))
+        candidates.append(("power", _r_squared(ya, amp * np.power(xa, b)), f"y = {amp:.3g}\u00b7x^{b:.3g}"))
+
+    return max(candidates, key=lambda c: c[1])
+
+
+def group_info_table(
+    df: pd.DataFrame,
+    x_col: str,
+    group_to_cols: dict[int, list[str]],
+    *,
+    value_label: str,
+    read_resistances: dict[str, float] | None = None,
+) -> pd.DataFrame:
+    """Per-group summary: device count, min/max first & last trace values, and best-fit function of the average curve.
+
+    When ``read_resistances`` (column -> IV read resistance in ohms) is given, also reports the group's
+    **average read resistance** and **average read conductance**.
+    """
+    def _fmt(v: float | None) -> str:
+        # Scientific notation with 8 significant figures so small values (e.g. ~1e-6 conductance)
+        # keep full instrument precision instead of being rounded to "0.000006".
+        return "" if v is None else f"{v:.8g}"
+
+    x_num = pd.to_numeric(df[x_col], errors="coerce").to_numpy(dtype=float)
+    rows: list[dict[str, Any]] = []
+    for gid in sorted(group_to_cols):
+        cols = group_to_cols[gid]
+        starts = [v for v in (first_valid_numeric_value(df[c]) for c in cols) if v is not None]
+        ends = [v for v in (last_valid_numeric_value(df[c]) for c in cols) if v is not None]
+        y_frame = pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce") for c in cols})
+        y_avg = y_frame.mean(axis=1, skipna=True).to_numpy(dtype=float)
+        name, r2, formula = fit_retention_form(x_num, y_avg)
+        row: dict[str, Any] = {
+            "Group": gid + 1,
+            "Devices": len(cols),
+            f"Start {value_label} (min)": _fmt(min(starts) if starts else None),
+            f"Start {value_label} (max)": _fmt(max(starts) if starts else None),
+            f"End {value_label} (min)": _fmt(min(ends) if ends else None),
+            f"End {value_label} (max)": _fmt(max(ends) if ends else None),
+        }
+        if read_resistances is not None:
+            r_vals = [read_resistances[c] for c in cols if read_resistances.get(c) is not None]
+            g_vals = [1.0 / r for r in r_vals if r != 0]
+            row["Avg read R (\u03a9)"] = _fmt(sum(r_vals) / len(r_vals) if r_vals else None)
+            row["Avg read G (S)"] = _fmt(sum(g_vals) / len(g_vals) if g_vals else None)
+        row["Best fit"] = name
+        row["R\u00b2"] = round(r2, 4) if r2 == r2 else None  # noqa: PLR0124 — NaN check
+        row["Formula (x = X axis)"] = formula
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def render_group_info(
+    df: pd.DataFrame,
+    x_col: str,
+    group_to_cols: dict[int, list[str]],
+    *,
+    value_label: str,
+    key: str,
+    read_resistances: dict[str, float] | None = None,
+) -> None:
+    """Render a per-group information table inside an expander."""
+    if not group_to_cols:
+        return
+    info = group_info_table(df, x_col, group_to_cols, value_label=value_label, read_resistances=read_resistances)
+    with st.expander("Group information"):
+        read_note = (
+            " It also reports the group's **average read resistance / conductance** at the read voltage."
+            if read_resistances is not None
+            else ""
+        )
+        st.caption(
+            "Per group: number of devices, the min/max of each device's **first** and **last** trace value, "
+            "and the **best-fit function** of the group's **average curve** over the X axis (chosen by R\u00b2 among "
+            "constant, linear, logarithmic, exponential, power)." + read_note
+        )
+        st.dataframe(info, use_container_width=True, key=f"group_info_{key}")
 
 
 def prepare_x_axis(df: pd.DataFrame, x_col: str) -> tuple[pd.Series[Any], str]:
@@ -972,6 +1205,394 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
                     f"the Y grid is still **multiplicative** (see power-of-10 ticks)."
                 )
 
+        if color_close_starts and groups:
+            group_to_cols: dict[int, list[str]] = {}
+            for col in plot_selected:
+                gid = groups.get(col)
+                if gid is None:
+                    continue
+                group_to_cols.setdefault(gid, []).append(col)
+            render_group_info(plot_df, x_col, group_to_cols, value_label=y_label, key=f"{wp}_{ns}")
+
+
+# Dedicated keys so the combined view never collides with the standalone retention/IV modes
+# (which expect companion keys like ``_retention_chk_ns`` whenever their df key is present).
+CORR_RET_DF_KEY = "corr_retention_df"
+CORR_IV_DF_KEY = "corr_iv_df"
+CORR_RET_CSV_ID = "_corr_ret_csv_id"
+CORR_IV_CSV_ID = "_corr_iv_csv_id"
+
+
+def _parse_uploaded_csv(uploaded: Any) -> pd.DataFrame | None:
+    """Parse an uploaded CSV with ``read_csv_bytes``; surface parse/empty errors in the UI."""
+    try:
+        df = read_csv_bytes(uploaded.getvalue())
+    except Exception as exc:  # noqa: BLE001 — surface parse errors in UI
+        st.error(f"Could not parse CSV: {exc}")
+        return None
+    if df.empty:
+        st.warning("The CSV has no rows.")
+        return None
+    return df
+
+
+def _correlation_sidebar_controls() -> None:
+    """Two uploaders + read settings for the combined retention/IV correlation view."""
+    ret_file = st.file_uploader("Upload retention CSV", type=["csv"], key="corr_ret_uploader")
+    iv_file = st.file_uploader("Upload IV CSV", type=["csv"], key="corr_iv_uploader")
+
+    if ret_file is not None:
+        rid = (ret_file.name, len(ret_file.getvalue()))
+        if st.session_state.get(CORR_RET_CSV_ID) != rid:
+            df = _parse_uploaded_csv(ret_file)
+            if df is not None:
+                st.session_state[CORR_RET_DF_KEY] = df
+                st.session_state[CORR_RET_CSV_ID] = rid
+
+    if iv_file is not None:
+        iid = (iv_file.name, len(iv_file.getvalue()))
+        if st.session_state.get(CORR_IV_CSV_ID) != iid:
+            df = _parse_uploaded_csv(iv_file)
+            if df is not None:
+                st.session_state[CORR_IV_DF_KEY] = df
+                st.session_state[CORR_IV_CSV_ID] = iid
+
+    have_ret = CORR_RET_DF_KEY in st.session_state
+    have_iv = CORR_IV_DF_KEY in st.session_state
+    if not (have_ret and have_iv):
+        st.info(
+            "Upload **both** a retention CSV (columns like `G3:0(S)`) and an IV CSV (columns like `I3:0(A)`). "
+            "Devices are matched by crossbar cell `(row, col)`. The SET read uses the **decreasing** branch "
+            "of the chosen polarity at the read voltage."
+        )
+        return
+
+    iv_df = st.session_state[CORR_IV_DF_KEY]
+    ret_df = st.session_state[CORR_RET_DF_KEY]
+    iv_cols = list(iv_df.columns)
+    ret_cols = list(ret_df.columns)
+
+    st.radio(
+        "Group devices by",
+        ["Retention", "IV read resistance"],
+        key="corr_group_by",
+        help="The chosen measurement defines the groups; both charts are then colored by those groups.",
+    )
+
+    v_guess = infer_voltage_column(iv_cols)
+    st.selectbox(
+        "IV voltage column",
+        options=iv_cols,
+        index=iv_cols.index(v_guess) if v_guess in iv_cols else 0,
+        key="corr_iv_vcol",
+    )
+    x_guess = infer_x_column(ret_cols)
+    st.selectbox(
+        "Retention X axis (time)",
+        options=ret_cols,
+        index=ret_cols.index(x_guess) if x_guess in ret_cols else 0,
+        key="corr_ret_xcol",
+    )
+
+    st.radio(
+        "SET polarity",
+        ["positive", "negative"],
+        key="corr_polarity",
+        help="Positive reads the 0\u2190+Vmax return branch; negative reads the 0\u2190\u2212Vmax return branch.",
+    )
+    st.number_input(
+        "Read voltage magnitude (V)",
+        min_value=0.0,
+        value=0.2,
+        step=0.05,
+        key="corr_read_mag",
+        help="Magnitude only; the sign is taken from the chosen SET polarity. Used for IV-based grouping.",
+    )
+    st.slider(
+        "Grouping threshold (%)",
+        min_value=1,
+        max_value=50,
+        value=10,
+        key="corr_thr",
+        help="Devices whose grouping values differ by <= threshold% are grouped (and colored) together.",
+    )
+    st.divider()
+    st.checkbox("Logarithmic retention Y", value=True, key="corr_ret_log")
+    st.checkbox(
+        "Derive resistance from conductance (R = 1/G)",
+        value=False,
+        key="corr_derive_resistance",
+        help="For conductance-like retention traces (e.g. G... or *(S)), plot derived resistance on the retention chart.",
+    )
+    st.checkbox(
+        "Logarithmic IV current (Y)",
+        value=False,
+        key="corr_iv_log",
+        help="Log Y plots **|current|** so positive and negative branches are visible.",
+    )
+
+
+_UNGROUPED_COLOR = "#9e9e9e"
+
+
+def _group_palette_color(gid: int) -> str:
+    return qualitative.Plotly[gid % len(qualitative.Plotly)]
+
+
+def _retention_iv_correlation_main() -> None:
+    """Match devices, group by the chosen measurement, and show retention + IV charts colored by group."""
+    have_ret = CORR_RET_DF_KEY in st.session_state
+    have_iv = CORR_IV_DF_KEY in st.session_state
+    if not (have_ret and have_iv):
+        st.info(
+            "Upload **both** a retention CSV and an IV CSV in the sidebar. Devices are matched by crossbar cell, "
+            "grouped by the chosen measurement, and shown on retention and IV charts colored by that grouping."
+        )
+        return
+
+    ret_df = st.session_state[CORR_RET_DF_KEY]
+    iv_df = st.session_state[CORR_IV_DF_KEY]
+
+    iv_cols = list(iv_df.columns)
+    ret_cols = list(ret_df.columns)
+    v_col = str(st.session_state.get("corr_iv_vcol", infer_voltage_column(iv_cols)))
+    if v_col not in iv_cols:
+        v_col = infer_voltage_column(iv_cols)
+    ret_x_col = str(st.session_state.get("corr_ret_xcol", infer_x_column(ret_cols)))
+    if ret_x_col not in ret_cols:
+        ret_x_col = infer_x_column(ret_cols)
+
+    group_by = str(st.session_state.get("corr_group_by", "Retention"))
+    polarity = str(st.session_state.get("corr_polarity", "positive"))
+    read_mag = float(st.session_state.get("corr_read_mag", 0.2))
+    read_voltage = read_mag if polarity == "positive" else -read_mag
+    threshold = float(st.session_state.get("corr_thr", 10))
+    ret_log = bool(st.session_state.get("corr_ret_log", True))
+    iv_log = bool(st.session_state.get("corr_iv_log", False))
+    derive_resistance = bool(st.session_state.get("corr_derive_resistance", False))
+
+    ret_map = crossbar_column_map(numeric_y_columns(ret_df, ret_x_col))
+    iv_map = crossbar_column_map(numeric_y_columns(iv_df, v_col))
+
+    common_cells = sorted(set(ret_map) & set(iv_map))
+    n_ret_only = len(set(ret_map) - set(iv_map))
+    n_iv_only = len(set(iv_map) - set(ret_map))
+
+    if not common_cells:
+        st.warning(
+            "No devices matched between the two files. Retention needs `G<r>:<c>` / `I<r>:<c>` style columns and "
+            "IV needs `I<r>:<c>(A)` / `G<r>:<c>` columns mapping to the same `(row, col)` crossbar cells."
+        )
+        return
+
+    voltage_series = iv_df[v_col]
+    rows: list[dict[str, Any]] = []
+    for (r, c) in common_cells:
+        ret_col = ret_map[(r, c)]
+        iv_col = iv_map[(r, c)]
+        ret_start = first_valid_numeric_value(ret_df[ret_col])
+        iv_r = iv_read_resistance(
+            voltage_series,
+            iv_df[iv_col],
+            polarity=polarity,
+            read_voltage=read_voltage,
+        )
+        rows.append(
+            {
+                "device": f"r{r}:c{c}",
+                "row": r,
+                "col": c,
+                "ret_col": ret_col,
+                "iv_col": iv_col,
+                "retention_start": ret_start,
+                "iv_read_R": iv_r,
+            }
+        )
+
+    table = pd.DataFrame(rows)
+
+    # Group by the chosen measurement; devices missing that value are left ungrouped (gray).
+    if group_by == "Retention":
+        basis_values = {row["device"]: row["retention_start"] for row in rows if row["retention_start"] is not None}
+        basis_label = "retention start value"
+    else:
+        basis_values = {row["device"]: row["iv_read_R"] for row in rows if row["iv_read_R"] is not None}
+        basis_label = f"IV read resistance at {read_voltage:+.3g} V"
+
+    groups = close_value_groups(basis_values, threshold_percent=threshold)
+    table["group"] = table["device"].map(lambda d: groups.get(d))
+    n_groups = len({g for g in groups.values()})
+    n_ungrouped = int(table["group"].isna().sum())
+
+    def _color_for(device: str) -> str:
+        gid = groups.get(device)
+        return _UNGROUPED_COLOR if gid is None else _group_palette_color(gid)
+
+    st.caption(
+        f"Grouped **{len(basis_values)}** devices by **{basis_label}** "
+        f"into **{n_groups}** group(s) at threshold **{threshold:.0f}%** "
+        f"(matched in both files: {len(common_cells)}; retention-only: {n_ret_only}; IV-only: {n_iv_only}; "
+        f"ungrouped/gray: {n_ungrouped})."
+    )
+
+    group_color_map = {gid: _group_palette_color(gid) for gid in sorted(set(groups.values()))}
+    ret_conductance_cols = [row["ret_col"] for row in rows if is_conductance_column(row["ret_col"])]
+    ret_y_label = "Conductance" if ret_conductance_cols else "Resistance"
+
+    # Retention chart can show derived resistance (R = 1/G) for conductance columns, like retention-only.
+    # Grouping still uses the raw retention start value (matching retention mode behavior).
+    ret_plot_df = ret_df
+    if derive_resistance and ret_conductance_cols:
+        ret_plot_df = ret_df.copy()
+        for col in ret_conductance_cols:
+            g = pd.to_numeric(ret_df[col], errors="coerce")
+            ret_plot_df[col] = (1.0 / g).where(g != 0)
+        ret_y_label = "Resistance"
+
+    # Group display + summary controls (mirrors the retention close-start group functionality).
+    ordered_gids = sorted(set(groups.values()))
+    group_counts = {gid: sum(1 for g in groups.values() if g == gid) for gid in ordered_gids}
+    group_labels = [f"Group {gid + 1} ({group_counts[gid]} devices)" for gid in ordered_gids]
+    label_to_gid = {label: gid for label, gid in zip(group_labels, ordered_gids, strict=False)}
+    ungrouped_label = f"Ungrouped ({n_ungrouped} devices)"
+    options = group_labels + ([ungrouped_label] if n_ungrouped else [])
+
+    groups_key = "corr_show_groups"
+    current = st.session_state.get(groups_key, options)
+    valid = [g for g in current if g in options]
+    if not valid:
+        valid = options
+    st.session_state[groups_key] = valid
+    picked = st.multiselect(
+        "Show groups",
+        options=options,
+        key=groups_key,
+        help="Pick which groups (colors) to display on both charts.",
+    )
+    picked_gids = {label_to_gid[label] for label in picked if label in label_to_gid}
+    show_ungrouped = ungrouped_label in picked
+    show_group_summary = st.toggle(
+        "Show group average + min/max band",
+        value=False,
+        key="corr_show_summary",
+        help="Per group, draw one average line and a light min-max band on both charts (ungrouped traces stay as lines).",
+    )
+
+    displayed_rows = [
+        row
+        for row in rows
+        if (groups.get(row["device"]) in picked_gids)
+        or (groups.get(row["device"]) is None and show_ungrouped)
+    ]
+    grouped_rows = [row for row in displayed_rows if groups.get(row["device"]) is not None]
+    ungrouped_rows = [row for row in displayed_rows if groups.get(row["device"]) is None]
+
+    if not displayed_rows:
+        st.warning("No groups selected to display.")
+        return
+
+    def _render_chart(
+        *,
+        df: pd.DataFrame,
+        x_col: str,
+        col_key: str,
+        log_y: bool,
+        y_label: str,
+        use_abs_y: bool,
+    ) -> go.Figure:
+        if show_group_summary:
+            base_cols = [row[col_key] for row in ungrouped_rows]
+            fig = plot_lines(
+                df,
+                x_col,
+                base_cols,
+                log_y=log_y,
+                y_quantity_label=y_label,
+                log_y_use_abs_y=use_abs_y,
+                trace_color_map={row[col_key]: _UNGROUPED_COLOR for row in ungrouped_rows},
+            )
+            grouped_cols = [row[col_key] for row in grouped_rows]
+            col_groups = {row[col_key]: groups[row["device"]] for row in grouped_rows}
+            add_group_summary_overlays(
+                fig,
+                df,
+                x_col,
+                grouped_cols,
+                col_groups,
+                group_color_map,
+                log_y=log_y,
+                log_y_use_abs_y=use_abs_y,
+            )
+            return fig
+        cols = [row[col_key] for row in displayed_rows]
+        return plot_lines(
+            df,
+            x_col,
+            cols,
+            log_y=log_y,
+            y_quantity_label=y_label,
+            log_y_use_abs_y=use_abs_y,
+            trace_color_map={row[col_key]: _color_for(row["device"]) for row in displayed_rows},
+        )
+
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.subheader("Retention")
+        st.plotly_chart(
+            _render_chart(
+                df=ret_plot_df,
+                x_col=ret_x_col,
+                col_key="ret_col",
+                log_y=ret_log,
+                y_label=ret_y_label,
+                use_abs_y=False,
+            ),
+            use_container_width=True,
+        )
+    with right_col:
+        st.subheader("IV characteristics")
+        st.plotly_chart(
+            _render_chart(
+                df=iv_df,
+                x_col=v_col,
+                col_key="iv_col",
+                log_y=iv_log,
+                y_label="Current",
+                use_abs_y=True,
+            ),
+            use_container_width=True,
+        )
+
+    st.caption(
+        f"Both charts are colored by the **{group_by}** grouping (same color = same group). "
+        "Gray traces are devices without a usable grouping value."
+    )
+
+    ret_group_to_cols: dict[int, list[str]] = {}
+    for row in grouped_rows:
+        ret_group_to_cols.setdefault(groups[row["device"]], []).append(row["ret_col"])
+    read_resistances = {row["ret_col"]: row["iv_read_R"] for row in grouped_rows if row["iv_read_R"] is not None}
+    render_group_info(
+        ret_plot_df,
+        ret_x_col,
+        ret_group_to_cols,
+        value_label=ret_y_label,
+        key="corr",
+        read_resistances=read_resistances,
+    )
+
+    with st.expander("Per-device groups and values"):
+        show = table[["device", "row", "col", "group", "retention_start", "iv_read_R"]].copy()
+        show["group"] = show["group"].map(lambda g: "ungrouped" if pd.isna(g) else int(g) + 1)
+        st.dataframe(show, use_container_width=True)
+        st.download_button(
+            "Export grouping table as CSV",
+            data=show.to_csv(index=False).encode("utf-8"),
+            file_name="retention_iv_groups.csv",
+            mime="text/csv",
+            key="corr_export",
+        )
+
 
 def main() -> None:
     st.set_page_config(page_title="Resistance retention viewer", layout="wide", initial_sidebar_state="expanded")
@@ -980,15 +1601,21 @@ def main() -> None:
     with st.sidebar:
         mode = st.radio(
             "Measurement",
-            ["Resistance retention", "IV characteristics"],
+            ["Resistance retention", "IV characteristics", "Retention \u2194 IV correlation"],
             label_visibility="visible",
         )
         st.divider()
-        cfg = RETENTION_VIEW if mode == "Resistance retention" else IV_VIEW
-        _wide_csv_sidebar_controls(cfg)
+        if mode == "Retention \u2194 IV correlation":
+            _correlation_sidebar_controls()
+        else:
+            cfg = RETENTION_VIEW if mode == "Resistance retention" else IV_VIEW
+            _wide_csv_sidebar_controls(cfg)
 
-    cfg = RETENTION_VIEW if mode == "Resistance retention" else IV_VIEW
-    _wide_csv_main_plot(cfg)
+    if mode == "Retention \u2194 IV correlation":
+        _retention_iv_correlation_main()
+    else:
+        cfg = RETENTION_VIEW if mode == "Resistance retention" else IV_VIEW
+        _wide_csv_main_plot(cfg)
 
 
 if __name__ == "__main__":
