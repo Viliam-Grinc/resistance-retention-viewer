@@ -272,6 +272,102 @@ def close_start_groups(
     return group_map
 
 
+def is_conductance_column(column_name: str) -> bool:
+    """Heuristic: crossbar conductance naming, e.g. ``G3:0(S)``."""
+    name = str(column_name).strip()
+    if re.match(r"^G\d+[:\-]\d+(?:\([^)]*\))?$", name, re.IGNORECASE):
+        return True
+    upper = name.upper()
+    return "(S)" in upper or upper.endswith("_S")
+
+
+def color_with_alpha(color: str, alpha: float) -> str:
+    """Convert hex/rgb color to rgba with requested alpha."""
+    c = str(color).strip()
+    if c.startswith("#") and len(c) == 7:
+        r = int(c[1:3], 16)
+        g = int(c[3:5], 16)
+        b = int(c[5:7], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+    if c.startswith("rgb(") and c.endswith(")"):
+        inner = c[4:-1]
+        return f"rgba({inner},{alpha})"
+    return color
+
+
+def add_group_summary_overlays(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    x_col: str,
+    traces: list[str],
+    groups: dict[str, int],
+    group_color_map: dict[int, str],
+    *,
+    log_y: bool,
+    log_y_use_abs_y: bool,
+) -> None:
+    """Add group average line and min/max band for plotted groups."""
+    x_series, _ = prepare_x_axis(df, x_col)
+    group_ids = sorted({groups[t] for t in traces if t in groups})
+    for gid in group_ids:
+        group_traces = [t for t in traces if groups.get(t) == gid]
+        if not group_traces:
+            continue
+        y_frame = pd.DataFrame(index=df.index)
+        for t in group_traces:
+            s = pd.to_numeric(df[t], errors="coerce")
+            if log_y and log_y_use_abs_y:
+                s = s.abs()
+            y_frame[t] = s
+
+        y_avg = y_frame.mean(axis=1, skipna=True)
+        y_min = y_frame.min(axis=1, skipna=True)
+        y_max = y_frame.max(axis=1, skipna=True)
+        if log_y:
+            y_avg = y_avg.where(y_avg > 0)
+            y_min = y_min.where(y_min > 0)
+            y_max = y_max.where(y_max > 0)
+
+        base = group_color_map.get(gid, qualitative.Plotly[gid % len(qualitative.Plotly)])
+        band = color_with_alpha(base, 0.18)
+        avg_line = color_with_alpha(base, 1.0)
+
+        fig.add_trace(
+            go.Scatter(
+                x=x_series,
+                y=y_max,
+                mode="lines",
+                line=dict(width=0, color=band),
+                showlegend=False,
+                hoverinfo="skip",
+                name=f"Group {gid + 1} max",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x_series,
+                y=y_min,
+                mode="lines",
+                line=dict(width=0, color=band),
+                fill="tonexty",
+                fillcolor=band,
+                showlegend=False,
+                hoverinfo="skip",
+                name=f"Group {gid + 1} min",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x_series,
+                y=y_avg,
+                mode="lines",
+                line=dict(color=avg_line, width=3),
+                name=f"Group {gid + 1} avg",
+                connectgaps=False,
+            )
+        )
+
+
 def prepare_x_axis(df: pd.DataFrame, x_col: str) -> tuple[pd.Series[Any], str]:
     """Return values for Plotly x and a label for the axis.
 
@@ -410,12 +506,12 @@ RETENTION_VIEW = WideCsvViewConfig(
         "When columns match `G<row>:<col>(…)` or `I<row>:<col>(…)` (same grid layout), use **Pick devices on 16×16 crossbar** and the grid in the main area."
     ),
     x_selectbox_label="X axis (time)",
-    log_y_checkbox_label="Logarithmic resistance (Y)",
+    log_y_checkbox_label="Logarithmic Y",
     log_y_default=True,
-    y_quantity_label="Resistance",
+    y_quantity_label="Y",
     non_positive_log_warning=(
-        "Some selected resistance values are **≤ 0**; they cannot be shown on a log axis "
-        "and may disappear. Turn off **Logarithmic resistance (Y)** in the sidebar to see them."
+        "Some selected values are **≤ 0**; they cannot be shown on a log axis "
+        "and may disappear. Turn off **Logarithmic Y** in the sidebar to see them."
     ),
     log_checkbox_help=None,
     crossbar_example="G3:0(S)",
@@ -513,6 +609,12 @@ def _wide_csv_sidebar_controls(cfg: WideCsvViewConfig) -> None:
             value=False,
             key=f"{wp}_relative_retention_{chk_ns}",
             help="Normalize each selected retention trace to its first valid value = 100%.",
+        )
+        st.checkbox(
+            "Derive resistance from conductance (R = 1/G)",
+            value=False,
+            key=f"{wp}_derive_resistance_{chk_ns}",
+            help="For conductance-like traces (e.g. G... or *(S)), plot derived resistance.",
         )
 
     x_col = str(st.session_state[xa_key])
@@ -697,6 +799,7 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
             key=f"{wp}_only_last_{ns}",
         )
         plot_selected = selected[-1:] if only_last else selected
+        derive_resistance = bool(st.session_state.get(f"{wp}_derive_resistance_{ns}", False)) if wp == "ret" else False
         color_close_starts = False
         close_threshold = 10
         if wp == "ret":
@@ -717,15 +820,27 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
 
         relative_retention = bool(st.session_state.get(f"{wp}_relative_retention_{ns}", False)) if wp == "ret" else False
         plot_df = df
-        y_label = cfg.y_quantity_label
-        if relative_retention:
+        selected_conductance = [col for col in plot_selected if is_conductance_column(col)]
+        y_label = "Conductance" if wp == "ret" and selected_conductance else "Resistance"
+
+        if derive_resistance:
             plot_df = df.copy()
+            for col in selected_conductance:
+                g = pd.to_numeric(df[col], errors="coerce")
+                plot_df[col] = (1.0 / g).where(g != 0)
+            y_label = "Resistance"
+
+        if relative_retention:
+            if plot_df is df:
+                plot_df = df.copy()
             for col in plot_selected:
-                plot_df[col] = relative_to_first_valid_percent(df[col])
+                plot_df[col] = relative_to_first_valid_percent(plot_df[col])
             y_label = "Retention (%)"
 
         trace_color_map: dict[str, str] | None = None
         groups: dict[str, int] = {}
+        group_color_map: dict[int, str] = {}
+        show_group_summary = False
         if color_close_starts:
             groups = close_start_groups(df, plot_selected, threshold_percent=float(close_threshold))
             palette = qualitative.Plotly
@@ -734,11 +849,18 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
                 gid = groups.get(name)
                 if gid is None:
                     continue
-                trace_color_map[name] = palette[gid % len(palette)]
+                group_color_map[gid] = palette[gid % len(palette)]
+                trace_color_map[name] = group_color_map[gid]
             if groups:
                 st.caption(f"Close-start groups: **{len(set(groups.values()))}** at threshold **{close_threshold}%**.")
+                st.caption(
+                    "Grouping formula: for starts `a` and `b`, "
+                    "`percent_diff = |a - b| / max(|a|, |b|, 1e-15) × 100`; "
+                    "traces are grouped when adjacent sorted starts are within the threshold."
+                )
                 ordered_group_ids = sorted(set(groups.values()))
-                group_labels = [f"Group {gid + 1}" for gid in ordered_group_ids]
+                group_counts = {gid: sum(1 for name in plot_selected if groups.get(name) == gid) for gid in ordered_group_ids}
+                group_labels = [f"Group {gid + 1} ({group_counts[gid]} devices)" for gid in ordered_group_ids]
                 group_label_to_id = {label: gid for label, gid in zip(group_labels, ordered_group_ids, strict=False)}
                 groups_key = f"{wp}_picked_groups_{ns}"
                 current = st.session_state.get(groups_key, group_labels)
@@ -759,10 +881,29 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
                     plot_selected = []
                 if trace_color_map is not None:
                     trace_color_map = {name: color for name, color in trace_color_map.items() if name in set(plot_selected)}
+                show_group_summary = st.toggle(
+                    "Show group average + min/max band",
+                    value=False,
+                    key=f"{wp}_show_group_summary_{ns}",
+                    help="Average is a line; min-max is shown as a light band for each displayed group.",
+                )
 
         if not plot_selected:
             st.warning("No traces left after group filtering.")
             return
+
+        export_x, _ = prepare_x_axis(plot_df, x_col)
+        export_df = pd.DataFrame({x_col: export_x})
+        for col in plot_selected:
+            export_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+        st.download_button(
+            "Export clean data as CSV",
+            data=export_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{wp}_clean_{ns}.csv",
+            mime="text/csv",
+            help="Exports the currently filtered traces (after selection, group filtering, and retention transforms).",
+            key=f"{wp}_export_clean_{ns}",
+        )
 
         if log_y_axis:
             bad = False
@@ -783,18 +924,35 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
                         "Some selected relative retention values are **≤ 0**; they cannot be shown on a log axis "
                         "and may disappear. Turn off logarithmic Y to see them."
                     )
+                elif derive_resistance:
+                    st.warning(
+                        "Some derived resistance values are **≤ 0** (or undefined from G=0); they cannot be shown on a log axis "
+                        "and may disappear. Turn off logarithmic Y to see them."
+                    )
                 else:
                     st.warning(cfg.non_positive_log_warning)
 
+        lines_to_plot = [] if show_group_summary else plot_selected
         fig = plot_lines(
             plot_df,
             x_col,
-            plot_selected,
+            lines_to_plot,
             log_y=log_y_axis,
             y_quantity_label=y_label,
             log_y_use_abs_y=cfg.log_y_use_abs_y,
             trace_color_map=trace_color_map,
         )
+        if show_group_summary and groups:
+            add_group_summary_overlays(
+                fig,
+                plot_df,
+                x_col,
+                plot_selected,
+                groups,
+                group_color_map,
+                log_y=log_y_axis,
+                log_y_use_abs_y=cfg.log_y_use_abs_y,
+            )
         st.plotly_chart(fig, use_container_width=True)
         if log_y_axis:
             y_flat: list[float] = []
