@@ -43,7 +43,15 @@ If your shell says `cd: no such file or directory: resistance-retention-viewer`,
 1. Right-click **`Resistance Viewer.app`** → **Open** → confirm **Open** (macOS may block unsigned local apps silently).
 2. Or run once: `./scripts/register_app.sh` (clears quarantine and ad-hoc signs the app).
 
-**Troubleshooting:** Check `~/Library/Logs/Resistance Viewer/app-launch.log` (did the app start?) and `viewer.log` (Streamlit). Stop any old server on port 8501 (`lsof -i :8501`) if a previous session is still running.
+**Troubleshooting:** Check `~/Library/Logs/Resistance Viewer/app-launch.log` (did the app start?) and `viewer.log` (Streamlit).
+
+If the browser shows **Internal Server Error** (often after upgrading the app or interrupting a first-time install), reset the cached environment and restart:
+
+```bash
+./scripts/repair_viewer.sh
+```
+
+That stops any Streamlit process on port 8501, deletes `~/Library/Application Support/Resistance Viewer/venvs/`, re-bundles the app, and forces a clean dependency install on the next launch.
 
 If you see **“Still starting…”** or a browser timeout notification, that is usually harmless: Streamlit can take a minute on a cold start while Python loads. The app keeps trying to open the browser for several minutes; you can also open `http://127.0.0.1:8501` yourself once the Dock shows Python running.
 
