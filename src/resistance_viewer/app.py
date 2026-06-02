@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.colors import qualitative
+from plotly.subplots import make_subplots
 import streamlit as st
 
 # Crossbar: ``G3:0(S)`` (conductance / state) or ``I3:0(A)`` / ``I3-0(A)`` (per-cell current) → row 3, col 0.
@@ -389,6 +390,75 @@ def is_conductance_column(column_name: str) -> bool:
         return True
     upper = name.upper()
     return "(S)" in upper or upper.endswith("_S")
+
+
+def _scalar_to_conductance(value: float, column_name: str) -> float:
+    """Express a scalar trace value as conductance (S); resistance columns use ``1/R``."""
+    return value if is_conductance_column(column_name) else (1.0 / value)
+
+
+def _retention_conductance_metrics(
+    ret_df: pd.DataFrame,
+    ret_col: str,
+) -> tuple[float | None, float | None, float | None]:
+    """Return ``(G_t0, G_final, retention_percent)`` in conductance space for one device."""
+    raw_start = first_valid_numeric_value(ret_df[ret_col])
+    raw_end = last_valid_numeric_value(ret_df[ret_col])
+    if raw_start is None or raw_end is None:
+        return None, None, None
+    g_t0 = _scalar_to_conductance(raw_start, ret_col)
+    g_final = _scalar_to_conductance(raw_end, ret_col)
+    if not (np.isfinite(g_t0) and np.isfinite(g_final) and g_t0 > 0):
+        return g_t0, g_final, None
+    retention = 100.0 * g_final / g_t0
+    return g_t0, g_final, retention
+
+
+def _aligned_finite_pairs(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    xa = np.asarray(x, dtype=float)
+    ya = np.asarray(y, dtype=float)
+    mask = np.isfinite(xa) & np.isfinite(ya)
+    return xa[mask], ya[mask]
+
+
+def _pearson(x: np.ndarray, y: np.ndarray) -> tuple[float | None, int]:
+    xa, ya = _aligned_finite_pairs(x, y)
+    n = int(xa.size)
+    if n < 2:
+        return None, n
+    return float(pd.Series(xa).corr(pd.Series(ya), method="pearson")), n
+
+
+def _spearman(x: np.ndarray, y: np.ndarray) -> tuple[float | None, int]:
+    """Spearman rho via Pearson on average ranks (no scipy dependency)."""
+    xa, ya = _aligned_finite_pairs(x, y)
+    n = int(xa.size)
+    if n < 2:
+        return None, n
+    rx = pd.Series(xa).rank(method="average").to_numpy(dtype=float)
+    ry = pd.Series(ya).rank(method="average").to_numpy(dtype=float)
+    return float(pd.Series(rx).corr(pd.Series(ry), method="pearson")), n
+
+
+def _partial_correlation_pearson(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> float | None:
+    r_xy, _ = _pearson(x, y)
+    r_xz, _ = _pearson(x, z)
+    r_yz, _ = _pearson(y, z)
+    if r_xy is None or r_xz is None or r_yz is None:
+        return None
+    denom = (1.0 - r_xz * r_xz) * (1.0 - r_yz * r_yz)
+    if denom <= 0:
+        return None
+    return (r_xy - r_xz * r_yz) / float(np.sqrt(denom))
+
+
+def _maybe_log10(values: np.ndarray, *, use_log: bool) -> np.ndarray:
+    if not use_log:
+        return values
+    out = values.astype(float, copy=True)
+    if np.any(out <= 0):
+        return values
+    return np.log10(out)
 
 
 def color_with_alpha(color: str, alpha: float) -> str:
@@ -1339,6 +1409,312 @@ def _group_palette_color(gid: int) -> str:
     return qualitative.Plotly[gid % len(qualitative.Plotly)]
 
 
+def _build_retention_iv_device_rows(
+    ret_df: pd.DataFrame,
+    iv_df: pd.DataFrame,
+    common_cells: list[tuple[int, int]],
+    ret_map: dict[tuple[int, int], str],
+    iv_map: dict[tuple[int, int], str],
+    voltage_series: Any,
+    *,
+    polarity: str,
+    read_voltage: float,
+) -> list[dict[str, Any]]:
+    """Match crossbar devices and compute retention start, IV read R, and conductance metrics."""
+    rows: list[dict[str, Any]] = []
+    for (r, c) in common_cells:
+        ret_col = ret_map[(r, c)]
+        iv_col = iv_map[(r, c)]
+        ret_start = first_valid_numeric_value(ret_df[ret_col])
+        iv_r = iv_read_resistance(
+            voltage_series,
+            iv_df[iv_col],
+            polarity=polarity,
+            read_voltage=read_voltage,
+        )
+        g_t0, _g_final, retention = _retention_conductance_metrics(ret_df, ret_col)
+        g_iv = (1.0 / iv_r) if iv_r is not None and iv_r != 0 else None
+        rows.append(
+            {
+                "device": f"r{r}:c{c}",
+                "row": r,
+                "col": c,
+                "ret_col": ret_col,
+                "iv_col": iv_col,
+                "retention_start": ret_start,
+                "iv_read_R": iv_r,
+                "G_t0": g_t0,
+                "G_iv": g_iv,
+                "retention": retention,
+            }
+        )
+    return rows
+
+
+def _analysis_metrics_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Devices with finite G_t0, G_iv, and end-point retention (%)."""
+    records = [
+        {
+            "device": row["device"],
+            "G_t0": row["G_t0"],
+            "G_iv": row["G_iv"],
+            "retention": row["retention"],
+        }
+        for row in rows
+        if row.get("G_t0") is not None
+        and row.get("G_iv") is not None
+        and row.get("retention") is not None
+        and np.isfinite(row["G_t0"])
+        and np.isfinite(row["G_iv"])
+        and np.isfinite(row["retention"])
+        and row["G_t0"] > 0
+        and row["G_iv"] > 0
+    ]
+    return pd.DataFrame(records)
+
+
+def _correlation_results_table(metrics: pd.DataFrame) -> pd.DataFrame:
+    """Pearson, Spearman, and partial coefficients for the analysis pairs."""
+    g_t0 = metrics["G_t0"].to_numpy(dtype=float)
+    g_iv = metrics["G_iv"].to_numpy(dtype=float)
+    retention = metrics["retention"].to_numpy(dtype=float)
+
+    def _row(pair: str, x: np.ndarray, y: np.ndarray, *, partial_z: np.ndarray | None = None) -> dict[str, Any]:
+        r_p, n = _pearson(x, y)
+        r_s, _ = _spearman(x, y)
+        partial = _partial_correlation_pearson(x, y, partial_z) if partial_z is not None else None
+        return {
+            "Pair": pair,
+            "n": n,
+            "Pearson r": None if r_p is None else round(r_p, 4),
+            "Spearman rho": None if r_s is None else round(r_s, 4),
+            "Partial r (Pearson)": None if partial is None else round(partial, 4),
+        }
+
+    rows_out = [
+        _row("G_iv vs retention", g_iv, retention),
+        _row("G_t0 vs retention", g_t0, retention),
+        _row("G_iv vs G_t0", g_iv, g_t0),
+        _row("G_iv vs retention | G_t0", g_iv, retention, partial_z=g_t0),
+    ]
+    return pd.DataFrame(rows_out)
+
+
+def _add_scatter_panel(
+    fig: go.Figure,
+    row: int,
+    col: int,
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    x_title: str,
+    y_title: str,
+    pearson_r: float | None,
+    spearman_r: float | None,
+    n: int,
+    log_x: bool = False,
+    log_y: bool = False,
+) -> None:
+    x_plot = _maybe_log10(x, use_log=log_x)
+    y_plot = _maybe_log10(y, use_log=log_y)
+    fig.add_trace(
+        go.Scatter(
+            x=x_plot,
+            y=y_plot,
+            mode="markers",
+            marker={"size": 8, "opacity": 0.55},
+            showlegend=False,
+        ),
+        row=row,
+        col=col,
+    )
+    if len(x_plot) >= 2:
+        coeffs = np.polyfit(x_plot, y_plot, 1)
+        x_line = np.linspace(float(np.min(x_plot)), float(np.max(x_plot)), 50)
+        y_line = coeffs[0] * x_line + coeffs[1]
+        fig.add_trace(
+            go.Scatter(
+                x=x_line,
+                y=y_line,
+                mode="lines",
+                line={"color": "rgba(220, 50, 50, 0.7)", "width": 2},
+                showlegend=False,
+            ),
+            row=row,
+            col=col,
+        )
+    x_suffix = " (log10)" if log_x else ""
+    y_suffix = " (log10)" if log_y else ""
+    r_txt = f"r={pearson_r:.3f}" if pearson_r is not None else "r=n/a"
+    rho_txt = f"ρ={spearman_r:.3f}" if spearman_r is not None else "ρ=n/a"
+    fig.add_annotation(
+        text=f"{r_txt}, {rho_txt}, n={n}",
+        xref="x domain",
+        yref="y domain",
+        x=0.02,
+        y=0.98,
+        xanchor="left",
+        yanchor="top",
+        showarrow=False,
+        font={"size": 11},
+        row=row,
+        col=col,
+    )
+    fig.update_xaxes(title_text=x_title + x_suffix, row=row, col=col)
+    fig.update_yaxes(title_text=y_title + y_suffix, row=row, col=col)
+
+
+def _correlation_summary_figure(metrics: pd.DataFrame, *, log_axes: bool) -> go.Figure:
+    """2×2 summary: three scatters and a correlation bar chart."""
+    g_t0 = metrics["G_t0"].to_numpy(dtype=float)
+    g_iv = metrics["G_iv"].to_numpy(dtype=float)
+    retention = metrics["retention"].to_numpy(dtype=float)
+    n = len(metrics)
+
+    r_iv_ret_p, _ = _pearson(g_iv, retention)
+    r_iv_ret_s, _ = _spearman(g_iv, retention)
+    r_t0_ret_p, _ = _pearson(g_t0, retention)
+    r_t0_ret_s, _ = _spearman(g_t0, retention)
+    r_iv_t0_p, _ = _pearson(g_iv, g_t0)
+    r_iv_t0_s, _ = _spearman(g_iv, g_t0)
+    r_partial = _partial_correlation_pearson(g_iv, retention, g_t0)
+
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=(
+            "G_t0 vs G_iv (first point vs IV read)",
+            "G_iv vs retention (%)",
+            "G_t0 vs retention (%)",
+            "Correlation coefficients",
+        ),
+        horizontal_spacing=0.12,
+        vertical_spacing=0.14,
+    )
+
+    _add_scatter_panel(
+        fig,
+        1,
+        1,
+        g_t0,
+        g_iv,
+        x_title="G_t0 (S)",
+        y_title="G_iv (S)",
+        pearson_r=r_iv_t0_p,
+        spearman_r=r_iv_t0_s,
+        n=n,
+        log_x=log_axes,
+        log_y=log_axes,
+    )
+    _add_scatter_panel(
+        fig,
+        1,
+        2,
+        g_iv,
+        retention,
+        x_title="G_iv (S)",
+        y_title="Retention (%)",
+        pearson_r=r_iv_ret_p,
+        spearman_r=r_iv_ret_s,
+        n=n,
+        log_x=log_axes,
+        log_y=False,
+    )
+    _add_scatter_panel(
+        fig,
+        2,
+        1,
+        g_t0,
+        retention,
+        x_title="G_t0 (S)",
+        y_title="Retention (%)",
+        pearson_r=r_t0_ret_p,
+        spearman_r=r_t0_ret_s,
+        n=n,
+        log_x=log_axes,
+        log_y=False,
+    )
+
+    categories = [
+        "G_iv~retention",
+        "G_t0~retention",
+        "G_iv~G_t0",
+        "partial G_iv~ret|G_t0",
+    ]
+    pearson_vals = [r_iv_ret_p, r_t0_ret_p, r_iv_t0_p, r_partial]
+    spearman_vals = [r_iv_ret_s, r_t0_ret_s, r_iv_t0_s, None]
+
+    fig.add_trace(
+        go.Bar(
+            name="Pearson",
+            x=categories,
+            y=[np.nan if v is None else v for v in pearson_vals],
+            marker_color="#636EFA",
+        ),
+        row=2,
+        col=2,
+    )
+    fig.add_trace(
+        go.Bar(
+            name="Spearman",
+            x=categories,
+            y=[np.nan if v is None else v for v in spearman_vals],
+            marker_color="#EF553B",
+        ),
+        row=2,
+        col=2,
+    )
+    fig.update_yaxes(title_text="Coefficient", range=[-1.05, 1.05], row=2, col=2)
+    fig.update_layout(
+        barmode="group",
+        height=820,
+        title_text=f"Correlation analysis (n={n} devices)",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
+    )
+    return fig
+
+
+def _correlation_analysis_tab(rows: list[dict[str, Any]]) -> None:
+    """Statistical correlations between G_t0, G_iv, and end-point retention."""
+    metrics = _analysis_metrics_dataframe(rows)
+    n = len(metrics)
+    n_matched = len(rows)
+    st.caption(
+        f"**{n}** of **{n_matched}** matched devices have finite G_t0, G_iv, and retention "
+        f"(retention = 100 × G_final / G_t0 in conductance space)."
+    )
+    if n < 3:
+        st.warning("Need at least **3** devices with valid metrics to compute correlations.")
+        return
+
+    results = _correlation_results_table(metrics)
+    st.dataframe(results, use_container_width=True, hide_index=True)
+
+    log_axes = st.checkbox(
+        "Log axes (G only; retention stays linear)",
+        value=False,
+        key="corr_analysis_log_g",
+        help="Apply log10 to G_t0 and G_iv on scatter plots when all values are positive.",
+    )
+
+    fig = _correlation_summary_figure(metrics, log_axes=log_axes)
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("Per-device metrics"):
+        show = metrics.copy()
+        for col in ("G_t0", "G_iv"):
+            show[col] = show[col].map(lambda v: f"{v:.8g}")
+        show["retention"] = show["retention"].map(lambda v: f"{v:.6g}")
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Export metrics as CSV",
+            data=metrics.to_csv(index=False).encode("utf-8"),
+            file_name="correlation_metrics.csv",
+            mime="text/csv",
+            key="corr_analysis_export",
+        )
+
+
 def _retention_iv_correlation_main() -> None:
     """Match devices, group by the chosen measurement, and show retention + IV charts colored by group."""
     have_ret = CORR_RET_DF_KEY in st.session_state
@@ -1385,30 +1761,16 @@ def _retention_iv_correlation_main() -> None:
         )
         return
 
-    voltage_series = iv_df[v_col]
-    rows: list[dict[str, Any]] = []
-    for (r, c) in common_cells:
-        ret_col = ret_map[(r, c)]
-        iv_col = iv_map[(r, c)]
-        ret_start = first_valid_numeric_value(ret_df[ret_col])
-        iv_r = iv_read_resistance(
-            voltage_series,
-            iv_df[iv_col],
-            polarity=polarity,
-            read_voltage=read_voltage,
-        )
-        rows.append(
-            {
-                "device": f"r{r}:c{c}",
-                "row": r,
-                "col": c,
-                "ret_col": ret_col,
-                "iv_col": iv_col,
-                "retention_start": ret_start,
-                "iv_read_R": iv_r,
-            }
-        )
-
+    rows = _build_retention_iv_device_rows(
+        ret_df,
+        iv_df,
+        common_cells,
+        ret_map,
+        iv_map,
+        iv_df[v_col],
+        polarity=polarity,
+        read_voltage=read_voltage,
+    )
     table = pd.DataFrame(rows)
 
     # Group by the chosen measurement; devices missing that value are left ungrouped (gray).
@@ -1429,11 +1791,11 @@ def _retention_iv_correlation_main() -> None:
         return _UNGROUPED_COLOR if gid is None else _group_palette_color(gid)
 
     st.caption(
-        f"Grouped **{len(basis_values)}** devices by **{basis_label}** "
-        f"into **{n_groups}** group(s) at threshold **{threshold:.0f}%** "
-        f"(matched in both files: {len(common_cells)}; retention-only: {n_ret_only}; IV-only: {n_iv_only}; "
-        f"ungrouped/gray: {n_ungrouped})."
+        f"Matched **{len(common_cells)}** devices in both files "
+        f"(retention-only: {n_ret_only}; IV-only: {n_iv_only})."
     )
+
+    tab_grouped, tab_analysis = st.tabs(["Grouped charts", "Correlation analysis"])
 
     group_color_map = {gid: _group_palette_color(gid) for gid in sorted(set(groups.values()))}
     ret_conductance_cols = [row["ret_col"] for row in rows if is_conductance_column(row["ret_col"])]
@@ -1457,141 +1819,151 @@ def _retention_iv_correlation_main() -> None:
     ungrouped_label = f"Ungrouped ({n_ungrouped} devices)"
     options = group_labels + ([ungrouped_label] if n_ungrouped else [])
 
-    groups_key = "corr_show_groups"
-    current = st.session_state.get(groups_key, options)
-    valid = [g for g in current if g in options]
-    if not valid:
-        valid = options
-    st.session_state[groups_key] = valid
-    picked = st.multiselect(
-        "Show groups",
-        options=options,
-        key=groups_key,
-        help="Pick which groups (colors) to display on both charts.",
-    )
-    picked_gids = {label_to_gid[label] for label in picked if label in label_to_gid}
-    show_ungrouped = ungrouped_label in picked
-    show_group_summary = st.toggle(
-        "Show group average + min/max band",
-        value=False,
-        key="corr_show_summary",
-        help="Per group, draw one average line and a light min-max band on both charts (ungrouped traces stay as lines).",
-    )
+    with tab_analysis:
+        _correlation_analysis_tab(rows)
 
-    displayed_rows = [
-        row
-        for row in rows
-        if (groups.get(row["device"]) in picked_gids)
-        or (groups.get(row["device"]) is None and show_ungrouped)
-    ]
-    grouped_rows = [row for row in displayed_rows if groups.get(row["device"]) is not None]
-    ungrouped_rows = [row for row in displayed_rows if groups.get(row["device"]) is None]
+    with tab_grouped:
+        st.caption(
+            f"Grouped **{len(basis_values)}** devices by **{basis_label}** "
+            f"into **{n_groups}** group(s) at threshold **{threshold:.0f}%** "
+            f"(ungrouped/gray: {n_ungrouped})."
+        )
 
-    if not displayed_rows:
-        st.warning("No groups selected to display.")
-        return
+        groups_key = "corr_show_groups"
+        current = st.session_state.get(groups_key, options)
+        valid = [g for g in current if g in options]
+        if not valid:
+            valid = options
+        st.session_state[groups_key] = valid
+        picked = st.multiselect(
+            "Show groups",
+            options=options,
+            key=groups_key,
+            help="Pick which groups (colors) to display on both charts.",
+        )
+        picked_gids = {label_to_gid[label] for label in picked if label in label_to_gid}
+        show_ungrouped = ungrouped_label in picked
+        show_group_summary = st.toggle(
+            "Show group average + min/max band",
+            value=False,
+            key="corr_show_summary",
+            help="Per group, draw one average line and a light min-max band on both charts (ungrouped traces stay as lines).",
+        )
 
-    def _render_chart(
-        *,
-        df: pd.DataFrame,
-        x_col: str,
-        col_key: str,
-        log_y: bool,
-        y_label: str,
-        use_abs_y: bool,
-    ) -> go.Figure:
-        if show_group_summary:
-            base_cols = [row[col_key] for row in ungrouped_rows]
-            fig = plot_lines(
+        displayed_rows = [
+            row
+            for row in rows
+            if (groups.get(row["device"]) in picked_gids)
+            or (groups.get(row["device"]) is None and show_ungrouped)
+        ]
+        grouped_rows = [row for row in displayed_rows if groups.get(row["device"]) is not None]
+        ungrouped_rows = [row for row in displayed_rows if groups.get(row["device"]) is None]
+
+        if not displayed_rows:
+            st.warning("No groups selected to display.")
+            return
+
+        def _render_chart(
+            *,
+            df: pd.DataFrame,
+            x_col: str,
+            col_key: str,
+            log_y: bool,
+            y_label: str,
+            use_abs_y: bool,
+        ) -> go.Figure:
+            if show_group_summary:
+                base_cols = [row[col_key] for row in ungrouped_rows]
+                fig = plot_lines(
+                    df,
+                    x_col,
+                    base_cols,
+                    log_y=log_y,
+                    y_quantity_label=y_label,
+                    log_y_use_abs_y=use_abs_y,
+                    trace_color_map={row[col_key]: _UNGROUPED_COLOR for row in ungrouped_rows},
+                )
+                grouped_cols = [row[col_key] for row in grouped_rows]
+                col_groups = {row[col_key]: groups[row["device"]] for row in grouped_rows}
+                add_group_summary_overlays(
+                    fig,
+                    df,
+                    x_col,
+                    grouped_cols,
+                    col_groups,
+                    group_color_map,
+                    log_y=log_y,
+                    log_y_use_abs_y=use_abs_y,
+                )
+                return fig
+            cols = [row[col_key] for row in displayed_rows]
+            return plot_lines(
                 df,
                 x_col,
-                base_cols,
+                cols,
                 log_y=log_y,
                 y_quantity_label=y_label,
                 log_y_use_abs_y=use_abs_y,
-                trace_color_map={row[col_key]: _UNGROUPED_COLOR for row in ungrouped_rows},
+                trace_color_map={row[col_key]: _color_for(row["device"]) for row in displayed_rows},
             )
-            grouped_cols = [row[col_key] for row in grouped_rows]
-            col_groups = {row[col_key]: groups[row["device"]] for row in grouped_rows}
-            add_group_summary_overlays(
-                fig,
-                df,
-                x_col,
-                grouped_cols,
-                col_groups,
-                group_color_map,
-                log_y=log_y,
-                log_y_use_abs_y=use_abs_y,
+
+        left_col, right_col = st.columns(2)
+        with left_col:
+            st.subheader("Retention")
+            st.plotly_chart(
+                _render_chart(
+                    df=ret_plot_df,
+                    x_col=ret_x_col,
+                    col_key="ret_col",
+                    log_y=ret_log,
+                    y_label=ret_y_label,
+                    use_abs_y=False,
+                ),
+                use_container_width=True,
             )
-            return fig
-        cols = [row[col_key] for row in displayed_rows]
-        return plot_lines(
-            df,
-            x_col,
-            cols,
-            log_y=log_y,
-            y_quantity_label=y_label,
-            log_y_use_abs_y=use_abs_y,
-            trace_color_map={row[col_key]: _color_for(row["device"]) for row in displayed_rows},
+        with right_col:
+            st.subheader("IV characteristics")
+            st.plotly_chart(
+                _render_chart(
+                    df=iv_df,
+                    x_col=v_col,
+                    col_key="iv_col",
+                    log_y=iv_log,
+                    y_label="Current",
+                    use_abs_y=True,
+                ),
+                use_container_width=True,
+            )
+
+        st.caption(
+            f"Both charts are colored by the **{group_by}** grouping (same color = same group). "
+            "Gray traces are devices without a usable grouping value."
         )
 
-    left_col, right_col = st.columns(2)
-    with left_col:
-        st.subheader("Retention")
-        st.plotly_chart(
-            _render_chart(
-                df=ret_plot_df,
-                x_col=ret_x_col,
-                col_key="ret_col",
-                log_y=ret_log,
-                y_label=ret_y_label,
-                use_abs_y=False,
-            ),
-            use_container_width=True,
-        )
-    with right_col:
-        st.subheader("IV characteristics")
-        st.plotly_chart(
-            _render_chart(
-                df=iv_df,
-                x_col=v_col,
-                col_key="iv_col",
-                log_y=iv_log,
-                y_label="Current",
-                use_abs_y=True,
-            ),
-            use_container_width=True,
+        ret_group_to_cols: dict[int, list[str]] = {}
+        for row in grouped_rows:
+            ret_group_to_cols.setdefault(groups[row["device"]], []).append(row["ret_col"])
+        read_resistances = {row["ret_col"]: row["iv_read_R"] for row in grouped_rows if row["iv_read_R"] is not None}
+        render_group_info(
+            ret_plot_df,
+            ret_x_col,
+            ret_group_to_cols,
+            value_label=ret_y_label,
+            key="corr",
+            read_resistances=read_resistances,
         )
 
-    st.caption(
-        f"Both charts are colored by the **{group_by}** grouping (same color = same group). "
-        "Gray traces are devices without a usable grouping value."
-    )
-
-    ret_group_to_cols: dict[int, list[str]] = {}
-    for row in grouped_rows:
-        ret_group_to_cols.setdefault(groups[row["device"]], []).append(row["ret_col"])
-    read_resistances = {row["ret_col"]: row["iv_read_R"] for row in grouped_rows if row["iv_read_R"] is not None}
-    render_group_info(
-        ret_plot_df,
-        ret_x_col,
-        ret_group_to_cols,
-        value_label=ret_y_label,
-        key="corr",
-        read_resistances=read_resistances,
-    )
-
-    with st.expander("Per-device groups and values"):
-        show = table[["device", "row", "col", "group", "retention_start", "iv_read_R"]].copy()
-        show["group"] = show["group"].map(lambda g: "ungrouped" if pd.isna(g) else int(g) + 1)
-        st.dataframe(show, use_container_width=True)
-        st.download_button(
-            "Export grouping table as CSV",
-            data=show.to_csv(index=False).encode("utf-8"),
-            file_name="retention_iv_groups.csv",
-            mime="text/csv",
-            key="corr_export",
-        )
+        with st.expander("Per-device groups and values"):
+            show = table[["device", "row", "col", "group", "retention_start", "iv_read_R"]].copy()
+            show["group"] = show["group"].map(lambda g: "ungrouped" if pd.isna(g) else int(g) + 1)
+            st.dataframe(show, use_container_width=True)
+            st.download_button(
+                "Export grouping table as CSV",
+                data=show.to_csv(index=False).encode("utf-8"),
+                file_name="retention_iv_groups.csv",
+                mime="text/csv",
+                key="corr_export",
+            )
 
 
 def main() -> None:

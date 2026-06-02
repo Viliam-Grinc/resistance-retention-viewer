@@ -120,17 +120,18 @@ Plotly also lets you click legend entries to hide or show traces without changin
 
 ## Retention ↔ IV correlation
 
-The **Measurement** radio in the sidebar has a third option, **Retention ↔ IV correlation**, that checks whether the groups you see in retention data line up with groups derived from IV (current–voltage) sweeps.
+The **Measurement** radio in the sidebar has a third option, **Retention ↔ IV correlation**, for comparing retention traces with IV sweeps on the same crossbar devices.
 
-- **Two uploads**: load **both** a retention CSV (columns like `G3:0(S)`) and an IV CSV (columns like `I3:0(A)`). Devices are matched by **crossbar cell** `(row, col)`, so `G3:0(S)` in retention and `I3:0(A)` in IV are treated as the same device. Only devices present in **both** files are analyzed (the app reports how many matched and how many were dropped).
-- **IV read voltage and polarity**: pick the **IV voltage column**, the **SET polarity** (positive or negative), and a **read voltage magnitude**. The signed read voltage is `+magnitude` for positive polarity and `−magnitude` for negative.
-- **Read branch rule**: an IV sweep has a rising part (`0 → ±Vmax`) and a decreasing/return part (`±Vmax → 0`). The read is taken **only on the decreasing branch** within the chosen polarity (the rising part is ignored), and the current at the read voltage is **linearly interpolated** along that branch (nearest point if the read voltage falls outside the branch range). The per-device read resistance is `R = read_voltage / I(read_voltage)`.
-- **Grouping**: retention devices are grouped by their **first valid value** (the existing close-start logic), and IV devices are grouped by **read resistance**. Each side has its own closeness threshold slider (devices within the threshold percent are grouped together).
-- **Three correlation views**:
-  - **Scatter** of retention start value vs IV read resistance per device, with **Pearson** (linear) and **Spearman** (rank) correlation coefficients. Axes can be log-scaled.
-  - **Group-label agreement**: a cross-tab of retention groups vs IV groups plus the **Adjusted Rand Index** (1.0 = identical grouping, ~0 = chance-level, negative = worse than chance).
-  - **Crossbar overlap**: two side-by-side 16×16 grids colored by group id (retention vs IV) using the same **X = row**, **Y = column** layout as the device picker, so spatial overlap is easy to eyeball.
-- Use the **Per-device table** expander to inspect or export (CSV) the matched values and group assignments.
+- **Two uploads**: load **both** a retention CSV (columns like `G3:0(S)`) and an IV CSV (columns like `I3:0(A)`). Devices are matched by **crossbar cell** `(row, col)`. Only devices present in **both** files are used (the app reports match counts).
+- **IV read voltage and polarity**: pick the **IV voltage column**, **SET polarity**, and **read voltage magnitude**. The signed read voltage is `+magnitude` for positive polarity and `−magnitude` for negative.
+- **Read branch rule**: the read is taken **only on the decreasing (return) branch** within the chosen polarity; current at the read voltage is **linearly interpolated** (nearest point if out of range). Per-device read resistance is `R = read_voltage / I(read_voltage)` and conductance is `G_iv = 1/R`.
+- **Grouped charts** tab: group devices by **retention start value** or **IV read resistance** (threshold slider), show side-by-side retention and IV Plotly charts colored by group, optional group-average overlays, and a **Per-device groups and values** export.
+- **Correlation analysis** tab (requires at least three devices with valid metrics):
+  - **G_t0**: first valid retention point in conductance (S); resistance columns are converted with `G = 1/R`.
+  - **G_iv**: conductance from the IV read at the chosen voltage.
+  - **retention**: end-point retention `100 × G_final / G_t0` in conductance space.
+  - Reports **Pearson** and **Spearman** for `G_iv` vs retention, `G_t0` vs retention, and `G_iv` vs `G_t0`, plus **partial Pearson** of `G_iv` vs retention controlling for `G_t0`.
+  - Summary figure: three scatter plots (with optional log10 on G axes) and a grouped bar chart of coefficients. Export per-device metrics as CSV from the expander.
 
 ## Optional install as a package
 
