@@ -358,6 +358,139 @@ def iv_read_resistance(
     return read_voltage / cur
 
 
+def _sanitize_iv_curve(voltage: Any, current: Any) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return sorted finite ``(V, I)`` arrays with duplicate voltages averaged."""
+    v = pd.to_numeric(pd.Series(voltage), errors="coerce").to_numpy(dtype=float)
+    i = pd.to_numeric(pd.Series(current), errors="coerce").to_numpy(dtype=float)
+    n = min(v.size, i.size)
+    if n < 2:
+        return None
+    v, i = v[:n], i[:n]
+    mask = np.isfinite(v) & np.isfinite(i)
+    v, i = v[mask], i[mask]
+    if v.size < 2:
+        return None
+
+    order = np.argsort(v)
+    v_sorted = v[order]
+    i_sorted = i[order]
+    v_unique, inv = np.unique(v_sorted, return_inverse=True)
+    if v_unique.size < 2:
+        return None
+    i_sum = np.bincount(inv, weights=i_sorted)
+    i_count = np.bincount(inv)
+    i_avg = i_sum / i_count
+    return v_unique.astype(float), i_avg.astype(float)
+
+
+def iv_curve_distance(
+    voltage_a: Any,
+    current_a: Any,
+    voltage_b: Any,
+    current_b: Any,
+    *,
+    grid_points: int = 400,
+    metric: str = "area",
+) -> float | None:
+    """Pairwise IV distance on overlap voltage range using selected metric."""
+    curve_a = _sanitize_iv_curve(voltage_a, current_a)
+    curve_b = _sanitize_iv_curve(voltage_b, current_b)
+    if curve_a is None or curve_b is None:
+        return None
+    v_a, i_a = curve_a
+    v_b, i_b = curve_b
+
+    v_min = max(float(v_a[0]), float(v_b[0]))
+    v_max = min(float(v_a[-1]), float(v_b[-1]))
+    if not np.isfinite(v_min) or not np.isfinite(v_max) or v_min >= v_max:
+        return None
+
+    points = max(int(grid_points), 2)
+    v_grid = np.linspace(v_min, v_max, points, dtype=float)
+    i_a_grid = np.interp(v_grid, v_a, i_a)
+    i_b_grid = np.interp(v_grid, v_b, i_b)
+    y = np.abs(i_a_grid - i_b_grid)
+    if metric == "max":
+        return float(np.max(y))
+    if metric == "sum":
+        return float(np.sum(y))
+    if metric == "area":
+        dx = np.diff(v_grid)
+        return float(np.sum((y[:-1] + y[1:]) * 0.5 * dx))
+    raise ValueError(f"Unknown IV distance metric: {metric}")
+
+
+def iv_pairwise_distance_matrix(
+    rows: list[dict[str, Any]],
+    iv_df: pd.DataFrame,
+    voltage_series: Any,
+    *,
+    grid_points: int = 400,
+    metric: str = "area",
+) -> tuple[list[str], np.ndarray]:
+    """Pairwise IV distances for rows with valid IV curves."""
+    valid_rows: list[dict[str, Any]] = []
+    for row in rows:
+        curve = _sanitize_iv_curve(voltage_series, iv_df[row["iv_col"]])
+        if curve is None:
+            continue
+        valid_rows.append(row)
+    devices = [str(row["device"]) for row in valid_rows]
+    n = len(devices)
+    dist = np.zeros((n, n), dtype=float)
+    if n == 0:
+        return devices, dist
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = iv_curve_distance(
+                voltage_series,
+                iv_df[valid_rows[i]["iv_col"]],
+                voltage_series,
+                iv_df[valid_rows[j]["iv_col"]],
+                grid_points=grid_points,
+                metric=metric,
+            )
+            if d is None or not np.isfinite(d):
+                d = float("inf")
+            dist[i, j] = d
+            dist[j, i] = d
+    return devices, dist
+
+
+def groups_from_pairwise_distances(
+    devices: list[str],
+    distance_matrix: np.ndarray,
+    *,
+    threshold: float,
+) -> dict[str, int]:
+    """Single-link threshold grouping via connected components on pairwise distances."""
+    n = len(devices)
+    if n == 0:
+        return {}
+    if distance_matrix.shape != (n, n):
+        raise ValueError("distance matrix shape must be NxN for provided devices")
+
+    visited = [False] * n
+    groups: dict[str, int] = {}
+    gid = 0
+    for start in range(n):
+        if visited[start]:
+            continue
+        stack = [start]
+        visited[start] = True
+        while stack:
+            idx = stack.pop()
+            groups[devices[idx]] = gid
+            neighbors = np.where(distance_matrix[idx] <= threshold)[0]
+            for nb in neighbors:
+                if nb == idx or visited[int(nb)]:
+                    continue
+                visited[int(nb)] = True
+                stack.append(int(nb))
+        gid += 1
+    return groups
+
+
 def adjusted_rand_index(labels_a: list[int], labels_b: list[int]) -> float | None:
     """Adjusted Rand Index between two cluster labelings (contingency-table formula); ``None`` if undefined."""
     if len(labels_a) != len(labels_b) or not labels_a:
@@ -906,6 +1039,23 @@ def _wide_csv_sidebar_controls(cfg: WideCsvViewConfig) -> None:
         key=f"{wp}_log_y_{chk_ns}",
         help=cfg.log_checkbox_help,
     )
+    if wp == "iv":
+        st.toggle(
+            "Color traces by IV curve similarity",
+            value=False,
+            key=f"{wp}_color_iv_similarity_{chk_ns}",
+            help="Groups traces by cumulative pointwise difference between IV curves on overlap voltage.",
+        )
+        if st.session_state.get(f"{wp}_color_iv_similarity_{chk_ns}", False):
+            st.number_input(
+                "IV similarity threshold",
+                min_value=0.0,
+                value=1e-3,
+                step=1e-3,
+                format="%.6f",
+                key=f"{wp}_iv_area_threshold_{chk_ns}",
+                help="Devices connect when the chosen pairwise IV distance metric is <= this threshold.",
+            )
     if wp == "ret":
         st.checkbox(
             "Relative retention (%)",
@@ -1105,6 +1255,8 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
         derive_resistance = bool(st.session_state.get(f"{wp}_derive_resistance_{ns}", False)) if wp == "ret" else False
         color_close_starts = False
         close_threshold = 10
+        color_iv_similarity = False
+        iv_area_threshold = 1e-3
         if wp == "ret":
             color_close_starts = st.toggle(
                 "Color traces by close start values",
@@ -1120,6 +1272,9 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
                     key=f"{wp}_close_start_threshold_{ns}",
                     help="Traces whose first valid values differ by <= threshold% are colored together.",
                 )
+        elif wp == "iv":
+            color_iv_similarity = bool(st.session_state.get(f"{wp}_color_iv_similarity_{ns}", False))
+            iv_area_threshold = float(st.session_state.get(f"{wp}_iv_area_threshold_{ns}", 1e-3))
 
         relative_retention = bool(st.session_state.get(f"{wp}_relative_retention_{ns}", False)) if wp == "ret" else False
         plot_df = df
@@ -1178,6 +1333,113 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
                     help="Pick which close-start groups to display.",
                 )
                 picked_ids = {group_label_to_id[g] for g in picked_labels}
+                browse_key = f"{wp}_browse_groups_{ns}"
+                browse_on = st.toggle(
+                    "Browse one group at a time",
+                    value=False,
+                    key=browse_key,
+                    help="Preview a single group without changing the active Show groups selection.",
+                )
+                if browse_on:
+                    browse_options = group_labels
+                    browse_pick = st.selectbox(
+                        "Browse group",
+                        options=browse_options,
+                        key=f"{wp}_browse_group_pick_{ns}",
+                    )
+                    browse_gid = group_label_to_id.get(browse_pick)
+                    picked_ids = set() if browse_gid is None else {browse_gid}
+                if picked_ids:
+                    plot_selected = [name for name in plot_selected if groups.get(name) in picked_ids]
+                else:
+                    plot_selected = []
+                if trace_color_map is not None:
+                    trace_color_map = {name: color for name, color in trace_color_map.items() if name in set(plot_selected)}
+                show_group_summary = st.toggle(
+                    "Show group average + min/max band",
+                    value=True,
+                    key=f"{wp}_show_group_summary_{ns}",
+                    help="Average is a line; min-max is shown as a light band for each displayed group.",
+                )
+        elif color_iv_similarity:
+            rows_for_distance = [{"device": name, "iv_col": name} for name in plot_selected]
+            similarity_cache_key = f"{wp}_iv_similarity_cache_{ns}"
+            similarity_signature = (
+                tuple(plot_selected),
+                str(x_col),
+                "sum",
+            )
+            cached = st.session_state.get(similarity_cache_key)
+            if isinstance(cached, dict) and cached.get("signature") == similarity_signature:
+                devices = list(cached["devices"])
+                dist = np.array(cached["dist"], dtype=float)
+            else:
+                devices, dist = iv_pairwise_distance_matrix(
+                    rows_for_distance,
+                    plot_df,
+                    plot_df[x_col],
+                    metric="sum",
+                )
+                st.session_state[similarity_cache_key] = {
+                    "signature": similarity_signature,
+                    "devices": list(devices),
+                    "dist": np.asarray(dist, dtype=float),
+                }
+            groups = groups_from_pairwise_distances(devices, dist, threshold=iv_area_threshold)
+            palette = qualitative.Plotly
+            trace_color_map = {}
+            for name in plot_selected:
+                gid = groups.get(name)
+                if gid is None:
+                    continue
+                group_color_map[gid] = palette[gid % len(palette)]
+                trace_color_map[name] = group_color_map[gid]
+            if groups:
+                n_groups = len(set(groups.values()))
+                st.caption(
+                    f"IV similarity groups: **{n_groups}** using **sum** "
+                    f"at threshold **{iv_area_threshold:.6g} A**."
+                )
+                st.caption(
+                    "Grouping formula: for each pair, compute distance on interpolated overlap-voltage grid "
+                    "(sum: Σ|ΔI|); "
+                    "traces are grouped when pairwise distance <= threshold and connected via single-link chaining."
+                )
+                ordered_group_ids = sorted(set(groups.values()))
+                group_counts = {
+                    gid: sum(1 for name in plot_selected if groups.get(name) == gid) for gid in ordered_group_ids
+                }
+                group_labels = [f"Group {gid + 1} ({group_counts[gid]} devices)" for gid in ordered_group_ids]
+                group_label_to_id = {label: gid for label, gid in zip(group_labels, ordered_group_ids, strict=False)}
+                groups_key = f"{wp}_picked_groups_{ns}"
+                current = st.session_state.get(groups_key, group_labels)
+                valid = [g for g in current if g in group_labels]
+                if not valid:
+                    valid = group_labels
+                st.session_state[groups_key] = valid
+                picked_labels = st.multiselect(
+                    "Show groups",
+                    options=group_labels,
+                    key=groups_key,
+                    help="Pick which IV similarity groups to display.",
+                )
+                picked_ids = {group_label_to_id[g] for g in picked_labels}
+                browse_key = f"{wp}_browse_groups_{ns}"
+                browse_on = st.toggle(
+                    "Browse one group at a time",
+                    value=False,
+                    key=browse_key,
+                    help="Preview a single group without changing the active Show groups selection.",
+                )
+                if browse_on:
+                    browse_options = group_labels
+                    browse_pick = st.selectbox(
+                        "Browse group",
+                        options=browse_options,
+                        key=f"{wp}_browse_group_pick_{ns}",
+                    )
+                    browse_gid = group_label_to_id.get(browse_pick)
+                    picked_ids = set() if browse_gid is None else {browse_gid}
                 if picked_ids:
                     plot_selected = [name for name in plot_selected if groups.get(name) in picked_ids]
                 else:
@@ -1275,7 +1537,7 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
                     f"the Y grid is still **multiplicative** (see power-of-10 ticks)."
                 )
 
-        if color_close_starts and groups:
+        if (color_close_starts or color_iv_similarity) and groups:
             group_to_cols: dict[int, list[str]] = {}
             for col in plot_selected:
                 gid = groups.get(col)
@@ -1344,7 +1606,7 @@ def _correlation_sidebar_controls() -> None:
 
     st.radio(
         "Group devices by",
-        ["Retention", "IV read resistance"],
+        ["Retention", "IV read resistance", "IV curve similarity"],
         key="corr_group_by",
         help="The chosen measurement defines the groups; both charts are then colored by those groups.",
     )
@@ -1376,7 +1638,7 @@ def _correlation_sidebar_controls() -> None:
         value=0.2,
         step=0.05,
         key="corr_read_mag",
-        help="Magnitude only; the sign is taken from the chosen SET polarity. Used for IV-based grouping.",
+        help="Magnitude only; the sign is taken from the chosen SET polarity. Used for IV read-resistance grouping.",
     )
     st.slider(
         "Grouping threshold (%)",
@@ -1385,6 +1647,15 @@ def _correlation_sidebar_controls() -> None:
         value=10,
         key="corr_thr",
         help="Devices whose grouping values differ by <= threshold% are grouped (and colored) together.",
+    )
+    st.number_input(
+        "IV similarity threshold",
+        min_value=0.0,
+        value=1e-3,
+        step=1e-3,
+        format="%.6f",
+        key="corr_iv_area_thr",
+        help="Devices connect when the chosen pairwise IV distance metric is <= this threshold.",
     )
     st.divider()
     st.checkbox("Logarithmic retention Y", value=True, key="corr_ret_log")
@@ -1743,6 +2014,7 @@ def _retention_iv_correlation_main() -> None:
     read_mag = float(st.session_state.get("corr_read_mag", 0.2))
     read_voltage = read_mag if polarity == "positive" else -read_mag
     threshold = float(st.session_state.get("corr_thr", 10))
+    iv_area_threshold = float(st.session_state.get("corr_iv_area_thr", 1e-3))
     ret_log = bool(st.session_state.get("corr_ret_log", True))
     iv_log = bool(st.session_state.get("corr_iv_log", False))
     derive_resistance = bool(st.session_state.get("corr_derive_resistance", False))
@@ -1777,11 +2049,37 @@ def _retention_iv_correlation_main() -> None:
     if group_by == "Retention":
         basis_values = {row["device"]: row["retention_start"] for row in rows if row["retention_start"] is not None}
         basis_label = "retention start value"
-    else:
+        groups = close_value_groups(basis_values, threshold_percent=threshold)
+        group_threshold_label = f"{threshold:.0f}%"
+    elif group_by == "IV read resistance":
         basis_values = {row["device"]: row["iv_read_R"] for row in rows if row["iv_read_R"] is not None}
         basis_label = f"IV read resistance at {read_voltage:+.3g} V"
+        groups = close_value_groups(basis_values, threshold_percent=threshold)
+        group_threshold_label = f"{threshold:.0f}%"
+    else:
+        basis_label = "IV curve similarity (area between curves)"
+        corr_similarity_signature = (
+            st.session_state.get(CORR_IV_CSV_ID),
+            tuple(row["iv_col"] for row in rows),
+            str(v_col),
+            "sum",
+        )
+        cached = st.session_state.get("corr_iv_similarity_cache")
+        if isinstance(cached, dict) and cached.get("signature") == corr_similarity_signature:
+            devices = list(cached["devices"])
+            dist = np.array(cached["dist"], dtype=float)
+        else:
+            devices, dist = iv_pairwise_distance_matrix(rows, iv_df, iv_df[v_col], metric="sum")
+            st.session_state["corr_iv_similarity_cache"] = {
+                "signature": corr_similarity_signature,
+                "devices": list(devices),
+                "dist": np.asarray(dist, dtype=float),
+            }
+        groups = groups_from_pairwise_distances(devices, dist, threshold=iv_area_threshold)
+        basis_values = {name: 0.0 for name in devices}
+        basis_label = "IV curve similarity (sum)"
+        group_threshold_label = f"{iv_area_threshold:.6g} A"
 
-    groups = close_value_groups(basis_values, threshold_percent=threshold)
     table["group"] = table["device"].map(lambda d: groups.get(d))
     n_groups = len({g for g in groups.values()})
     n_ungrouped = int(table["group"].isna().sum())
@@ -1825,7 +2123,7 @@ def _retention_iv_correlation_main() -> None:
     with tab_grouped:
         st.caption(
             f"Grouped **{len(basis_values)}** devices by **{basis_label}** "
-            f"into **{n_groups}** group(s) at threshold **{threshold:.0f}%** "
+            f"into **{n_groups}** group(s) at threshold **{group_threshold_label}** "
             f"(ungrouped/gray: {n_ungrouped})."
         )
 
@@ -1843,9 +2141,28 @@ def _retention_iv_correlation_main() -> None:
         )
         picked_gids = {label_to_gid[label] for label in picked if label in label_to_gid}
         show_ungrouped = ungrouped_label in picked
+        browse_on = st.toggle(
+            "Browse one group at a time",
+            value=False,
+            key="corr_browse_groups",
+            help="Preview one group without changing the active Show groups selection.",
+        )
+        if browse_on:
+            browse_pick = st.selectbox(
+                "Browse group",
+                options=options,
+                key="corr_browse_group_pick",
+            )
+            if browse_pick == ungrouped_label:
+                picked_gids = set()
+                show_ungrouped = True
+            else:
+                gid = label_to_gid.get(browse_pick)
+                picked_gids = set() if gid is None else {gid}
+                show_ungrouped = False
         show_group_summary = st.toggle(
             "Show group average + min/max band",
-            value=False,
+            value=(group_by == "IV curve similarity"),
             key="corr_show_summary",
             help="Per group, draw one average line and a light min-max band on both charts (ungrouped traces stay as lines).",
         )
@@ -1956,6 +2273,8 @@ def _retention_iv_correlation_main() -> None:
         with st.expander("Per-device groups and values"):
             show = table[["device", "row", "col", "group", "retention_start", "iv_read_R"]].copy()
             show["group"] = show["group"].map(lambda g: "ungrouped" if pd.isna(g) else int(g) + 1)
+            show["grouping_basis"] = group_by
+            show["grouping_threshold"] = group_threshold_label
             st.dataframe(show, use_container_width=True)
             st.download_button(
                 "Export grouping table as CSV",
