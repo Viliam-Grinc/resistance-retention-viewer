@@ -8,7 +8,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import comb
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -17,10 +17,10 @@ from plotly.colors import qualitative
 from plotly.subplots import make_subplots
 import streamlit as st
 
-# Crossbar: ``G3:0(S)`` (conductance / state) or ``I3:0(A)`` / ``I3-0(A)`` (per-cell current) → row 3, col 0.
+# Crossbar: ``G3:0(S)`` (conductance), ``R3:0(Ohm)`` (resistance), or ``I3:0(A)`` / ``I3-0(A)`` (current) → row 3, col 0.
 # Same 16×16 layout: top header = row index, left labels = column index (0-based).
 GRID_SIZE = 16
-_CROSSBAR_RE = re.compile(r"^(?:G|I)(\d+)[:\-](\d+)(?:\([^)]*\))?$", re.IGNORECASE)
+_CROSSBAR_RE = re.compile(r"^(?:G|I|R)(\d+)[:\-](\d+)(?:\([^)]*\))?$", re.IGNORECASE)
 
 
 def _decode_csv_text(raw: bytes) -> str:
@@ -44,7 +44,7 @@ def cleanup_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_crossbar_cell(column_name: str) -> tuple[int, int] | None:
-    """Parse ``G<r>:<c>(…)`` or ``I<r>:<c>(…)`` / hyphen form; return ``(row, col)`` if inside the grid."""
+    """Parse ``G/R/I<r>:<c>(…)`` or hyphen form; return ``(row, col)`` if inside the grid."""
     m = _CROSSBAR_RE.match(str(column_name).strip())
     if not m:
         return None
@@ -59,7 +59,7 @@ def render_crossbar_checkbox_grid(grid_map: dict[tuple[int, int], str], *, wp: s
     st.subheader("Crossbar (16×16)")
     st.caption(
         "Check cells to plot. **X (top) = row index**, **Y (left) = column index** "
-        "from `G<row>:<col>`, `I<row>:<col>`, or hyphen forms. Hover a checkbox for the CSV column name."
+        "from `G/R/I<row>:<col>` or hyphen forms. Hover a checkbox for the CSV column name."
     )
     header = st.columns([0.55] + [1] * GRID_SIZE)
     header[0].write("")
@@ -197,6 +197,39 @@ def infer_voltage_column(columns: list[str]) -> str:
     return columns[0]
 
 
+def infer_pulse_count_column(columns: list[str]) -> str:
+    """Pick a likely pulse-count column for PD sweeps; otherwise first column."""
+    if not columns:
+        raise ValueError("CSV has no columns")
+    preferred_exact = ("pulsecount", "pulse_count", "pulses", "pulse")
+    lower_map = {c.lower().strip(): c for c in columns}
+    for p in preferred_exact:
+        if p in lower_map:
+            return lower_map[p]
+    prefix_starts = ("pulsecount", "pulse_count", "pulses", "pulse")
+    for col in columns:
+        cl = col.lower().strip()
+        if any(cl == ps or cl.startswith(f"{ps}(") or cl.startswith(f"{ps}[") for ps in prefix_starts):
+            return col
+    return columns[0]
+
+
+def pd_metadata_columns(columns: list[str]) -> set[str]:
+    """Columns that are measurement metadata, not device traces (e.g. Vset)."""
+    out: set[str] = set()
+    for col in columns:
+        cl = col.lower().strip()
+        if cl.startswith("vset") or cl.startswith("v_set") or cl.startswith("setvoltage") or cl.startswith("set_voltage"):
+            out.add(col)
+    return out
+
+
+def pd_y_columns(df: pd.DataFrame, x_col: str) -> list[str]:
+    """Plottable PD trace columns: numeric Y minus X and metadata."""
+    meta = pd_metadata_columns(list(df.columns))
+    return [c for c in numeric_y_columns(df, x_col) if c not in meta]
+
+
 def numeric_y_columns(df: pd.DataFrame, x_col: str) -> list[str]:
     """Columns plottable as Y: not X, and numeric or convertible with some valid values."""
     out: list[str] = []
@@ -297,6 +330,111 @@ def close_start_groups(
             continue
         values[name] = v
     return close_value_groups(values, threshold_percent=threshold_percent)
+
+
+def series_to_conductance(series: pd.Series[Any], column_name: str) -> pd.Series[Any]:
+    """Convert a trace column to conductance (S); resistance columns use ``G = 1/R``."""
+    num = pd.to_numeric(series, errors="coerce")
+    if is_conductance_column(column_name):
+        return num
+    return (1.0 / num).where(num != 0)
+
+
+def df_traces_to_conductance(df: pd.DataFrame, traces: list[str]) -> pd.DataFrame:
+    """Return a copy of ``df`` with selected trace columns expressed as conductance."""
+    out = df.copy()
+    for col in traces:
+        out[col] = series_to_conductance(df[col], col)
+    return out
+
+
+def evenly_spaced_targets(g_lo: float, g_hi: float, n: int, *, spacing: Literal["linear", "log"]) -> np.ndarray:
+    """Return ``n`` target conductances between ``g_lo`` and ``g_hi``."""
+    if n < 1:
+        return np.array([], dtype=float)
+    if n == 1:
+        return np.array([(g_lo + g_hi) / 2.0], dtype=float)
+    if spacing == "log":
+        if g_lo <= 0 or g_hi <= 0:
+            return np.linspace(g_lo, g_hi, n)
+        return np.geomspace(g_lo, g_hi, n)
+    return np.linspace(g_lo, g_hi, n)
+
+
+def interp_pulse_at_conductance(
+    pulses: np.ndarray,
+    conductance: np.ndarray,
+    target_g: float,
+) -> float | None:
+    """Inverse-interpolate pulse count for a target conductance on a PD curve.
+
+    Assumes the inputs already describe the first potentiation branch.
+    """
+    mask = np.isfinite(pulses) & np.isfinite(conductance) & (conductance > 0)
+    x_p = pulses[mask]
+    y_g = conductance[mask]
+    if x_p.size < 2:
+        return None
+    order = np.argsort(x_p)
+    x_sorted = x_p[order]
+    y_sorted = np.maximum.accumulate(y_g[order])
+    if target_g < float(y_sorted[0]) or target_g > float(y_sorted[-1]):
+        return None
+    return float(np.interp(target_g, y_sorted, x_sorted))
+
+
+def group_average_curve(
+    df: pd.DataFrame,
+    x_col: str,
+    traces: list[str],
+    *,
+    gid: int,
+    groups: dict[str, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mean conductance curve for one group."""
+    group_traces = [t for t in traces if groups.get(t) == gid]
+    if not group_traces:
+        return np.array([]), np.array([])
+    x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(dtype=float)
+    stacks = [pd.to_numeric(df[t], errors="coerce").to_numpy(dtype=float) for t in group_traces]
+    y_avg = np.nanmean(np.vstack(stacks), axis=0)
+    return x, y_avg
+
+
+def first_potentiation_segment(pulses: np.ndarray, conductance: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Keep only the first potentiation branch up to its first turning point."""
+    mask = np.isfinite(pulses) & np.isfinite(conductance) & (conductance > 0)
+    x_p = pulses[mask]
+    y_g = conductance[mask]
+    if x_p.size < 2:
+        return x_p, y_g
+    order = np.argsort(x_p)
+    x_sorted = x_p[order]
+    y_sorted = y_g[order]
+    running_max = float(y_sorted[0])
+    peak_idx = 0
+    for idx in range(1, y_sorted.size):
+        value = float(y_sorted[idx])
+        if value >= running_max:
+            running_max = value
+            peak_idx = idx
+            continue
+        # First substantial drop after a real rise marks the start of depression.
+        if running_max > float(y_sorted[0]) * 1.02 and value < running_max * 0.98:
+            return x_sorted[: peak_idx + 1], y_sorted[: peak_idx + 1]
+    peak_idx = int(np.nanargmax(y_sorted))
+    return x_sorted[: peak_idx + 1], y_sorted[: peak_idx + 1]
+
+
+def pd_read_vset_mv(df: pd.DataFrame) -> float | None:
+    """Read constant Vset from a metadata column, if present."""
+    for col in df.columns:
+        if col not in pd_metadata_columns(list(df.columns)):
+            continue
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        if not s.empty:
+            return float(s.iloc[0])
+    return None
 
 
 def _interp_current_at(voltage: np.ndarray, current: np.ndarray, read_voltage: float) -> float | None:
@@ -950,6 +1088,15 @@ def is_conductance_column(column_name: str) -> bool:
     return "(S)" in upper or upper.endswith("_S")
 
 
+def is_resistance_column(column_name: str) -> bool:
+    """Heuristic: crossbar resistance naming, e.g. ``R3:0(Ohm)``."""
+    name = str(column_name).strip()
+    if re.match(r"^R\d+[:\-]\d+(?:\([^)]*\))?$", name, re.IGNORECASE):
+        return True
+    upper = name.upper()
+    return "(OHM)" in upper or upper.endswith("_OHM")
+
+
 def _scalar_to_conductance(value: float, column_name: str) -> float:
     """Express a scalar trace value as conductance (S); resistance columns use ``1/R``."""
     return value if is_conductance_column(column_name) else (1.0 / value)
@@ -1408,6 +1555,40 @@ IV_VIEW = WideCsvViewConfig(
     log_y_use_abs_y=True,
 )
 
+PD_VIEW = WideCsvViewConfig(
+    wp="pd",
+    df_key="pd_df",
+    csv_id_key="_pd_csv_id",
+    x_guess_key="_pd_x_guess",
+    chk_ns_key="_pd_chk_ns",
+    infer_default_x=infer_pulse_count_column,
+    uploader_label="Upload PD CSV",
+    uploader_key="pd_file_uploader",
+    empty_info=(
+        "Upload a **wide** PD CSV: one column for **pulse count** (e.g. `PulseCount`) and **one column per device** "
+        "(e.g. `R3:0(Ohm)` or `G3:0(S)`). Metadata columns like `Vset(mV)` are excluded from traces. "
+        "Use the **sidebar** to pick devices on the **16×16 crossbar** when `R…` / `G…` / `I…` columns are present."
+    ),
+    x_selectbox_label="X axis (pulse count)",
+    log_y_checkbox_label="Logarithmic conductance (Y)",
+    log_y_default=True,
+    y_quantity_label="Conductance",
+    non_positive_log_warning=(
+        "Some selected conductance values are **≤ 0**; they cannot be shown on a log axis "
+        "and may disappear. Turn off **Logarithmic conductance (Y)** to see them."
+    ),
+    log_checkbox_help=None,
+    crossbar_example="R3:0(Ohm)",
+    trace_kind_tip="conductance",
+)
+
+
+def _y_columns_for_view(cfg: WideCsvViewConfig, df: pd.DataFrame, x_col: str) -> list[str]:
+    if cfg.wp == "pd":
+        return pd_y_columns(df, x_col)
+    return numeric_y_columns(df, x_col)
+
+
 def _x_axis_state_key(wp: str) -> str:
     return f"{wp}_x_axis_column"
 
@@ -1493,8 +1674,25 @@ def _wide_csv_sidebar_controls(cfg: WideCsvViewConfig) -> None:
             key=f"{wp}_derive_resistance_{chk_ns}",
             help="For conductance-like traces (e.g. G... or *(S)), plot derived resistance.",
         )
+    if wp == "pd":
+        st.toggle(
+            "Color traces by close start conductance",
+            value=True,
+            key=f"{wp}_color_close_starts_{chk_ns}",
+            help="Group devices whose conductance at pulse 0 differs by at most the threshold below.",
+        )
+        if st.session_state.get(f"{wp}_color_close_starts_{chk_ns}", True):
+            st.slider(
+                "Close-start threshold (%)",
+                min_value=1,
+                max_value=50,
+                value=10,
+                key=f"{wp}_close_start_threshold_{chk_ns}",
+                help="Traces whose starting conductance differs by <= threshold% are colored together.",
+            )
+
     x_col = str(st.session_state[xa_key])
-    y_cols = numeric_y_columns(cfg, df, x_col)
+    y_cols = _y_columns_for_view(cfg, df, x_col)
     if not y_cols:
         st.warning("No plottable numeric series found (excluding the X column).")
         return
@@ -1591,6 +1789,117 @@ def _wide_csv_sidebar_controls(cfg: WideCsvViewConfig) -> None:
         )
 
 
+def _pd_pulse_planner_ui_and_markers(
+    fig: go.Figure,
+    *,
+    raw_df: pd.DataFrame,
+    plot_df: pd.DataFrame,
+    x_col: str,
+    plot_selected: list[str],
+    groups: dict[str, int],
+    group_color_map: dict[int, str],
+    ns: str,
+) -> pd.DataFrame | None:
+    """Retention pulse planner UI; add target markers to ``fig`` and return the plan table."""
+    if not groups or not plot_selected:
+        return None
+
+    visible_gids = sorted({groups[t] for t in plot_selected if t in groups})
+    if not visible_gids:
+        return None
+
+    st.divider()
+    st.subheader("Retention pulse planner")
+    st.caption(
+        "Pick **N** future retention starting conductances evenly on Y; the complementary **SET pulse count** "
+        "is read from the **first potentiation branch** of the **group-average** PD curve."
+    )
+
+    n_ret = st.number_input(
+        "Number of retention measurements",
+        min_value=2,
+        max_value=50,
+        value=5,
+        step=1,
+        key=f"pd_n_retention_{ns}",
+    )
+    spacing = st.radio(
+        "Target conductance spacing",
+        options=["Linear conductance", "Logarithmic conductance"],
+        horizontal=True,
+        key=f"pd_target_spacing_{ns}",
+    )
+    spacing_mode: Literal["linear", "log"] = "log" if spacing.startswith("Log") else "linear"
+
+    plan_gid = visible_gids[0]
+    if len(visible_gids) > 1:
+        gid_labels = [f"Group {gid + 1}" for gid in visible_gids]
+        gid_label_to_id = {label: gid for label, gid in zip(gid_labels, visible_gids, strict=False)}
+        picked = st.selectbox(
+            "Plan for group",
+            options=gid_labels,
+            key=f"pd_plan_group_{ns}",
+        )
+        plan_gid = gid_label_to_id[picked]
+
+    x_vals, y_avg = group_average_curve(plot_df, x_col, plot_selected, gid=plan_gid, groups=groups)
+    finite = np.isfinite(x_vals) & np.isfinite(y_avg) & (y_avg > 0)
+    x_f = x_vals[finite]
+    y_f = y_avg[finite]
+    if x_f.size < 2:
+        st.warning("Not enough valid points on the group-average curve to plan retention pulses.")
+        return None
+
+    x_sorted, y_first = first_potentiation_segment(x_f, y_f)
+    if x_sorted.size < 2:
+        st.warning("Not enough valid points on the first potentiation branch to plan retention pulses.")
+        return None
+    y_envelope = np.maximum.accumulate(y_first)
+    g_lo = float(y_envelope[0])
+    g_hi = float(y_envelope[-1])
+    targets = evenly_spaced_targets(g_lo, g_hi, int(n_ret), spacing=spacing_mode)
+    vset = pd_read_vset_mv(raw_df)
+
+    records: list[dict[str, Any]] = []
+    marker_x: list[float] = []
+    marker_y: list[float] = []
+    marker_text: list[str] = []
+    for i, target_g in enumerate(targets, start=1):
+        pulse_raw = interp_pulse_at_conductance(x_sorted, y_envelope, float(target_g))
+        pulse = None if pulse_raw is None else float(np.ceil(pulse_raw))
+        records.append(
+            {
+                "Group": plan_gid + 1,
+                "Target #": i,
+                "Target conductance (S)": target_g,
+                "Recommended SET pulses": pulse,
+                "Vset (mV)": vset,
+            }
+        )
+        if pulse is not None:
+            marker_x.append(pulse)
+            marker_y.append(float(target_g))
+            marker_text.append(f"Target {i}<br>G={target_g:.3e} S<br>pulses={pulse:.1f}")
+
+    if marker_x:
+        base = group_color_map.get(plan_gid, qualitative.Plotly[plan_gid % len(qualitative.Plotly)])
+        fig.add_trace(
+            go.Scatter(
+                x=marker_x,
+                y=marker_y,
+                mode="markers+text",
+                text=[f"T{i}" for i in range(1, len(marker_x) + 1)],
+                textposition="top center",
+                marker=dict(size=12, color=base, symbol="diamond", line=dict(width=1, color="white")),
+                name=f"Retention plan (G{plan_gid + 1})",
+                hovertext=marker_text,
+                hoverinfo="text",
+            )
+        )
+
+    return pd.DataFrame(records)
+
+
 def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
     """Main area: left = crossbar + data preview; right = chart (sidebar unchanged)."""
     wp = cfg.wp
@@ -1608,7 +1917,7 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
     chk_ns = str(st.session_state[cfg.chk_ns_key])
     log_y_axis = bool(st.session_state.get(f"{wp}_log_y_{chk_ns}", cfg.log_y_default))
 
-    y_cols = numeric_y_columns(df, x_col)
+    y_cols = _y_columns_for_view(cfg, df, x_col)
     if not y_cols:
         st.warning("No plottable numeric series found (excluding the X column).")
         return
@@ -1650,11 +1959,17 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
     left_col, chart_col = st.columns([left_w, chart_pct])
 
     with left_col:
-        if wp == "iv" and y_cols and not grid_map:
-            st.info(
-                "No **16×16 crossbar** column names were found. Expected patterns like `I3:0(A)`, `G3:0(I)`, or hyphen forms "
-                "(row and column 0–15; **I** = per-cell current, **G** = conductance/state). Use the **sidebar** multiselect or per-series checkboxes."
-            )
+        if wp in ("iv", "pd") and y_cols and not grid_map:
+            if wp == "iv":
+                st.info(
+                    "No **16×16 crossbar** column names were found. Expected patterns like `I3:0(A)`, `G3:0(I)`, or hyphen forms "
+                    "(row and column 0–15; **I** = per-cell current, **G** = conductance/state). Use the **sidebar** multiselect or per-series checkboxes."
+                )
+            else:
+                st.info(
+                    "No **16×16 crossbar** column names were found. Expected patterns like `R3:0(Ohm)`, `G3:0(S)`, or hyphen forms "
+                    "(row and column 0–15). Use the **sidebar** multiselect or per-series checkboxes."
+                )
 
         if grid_map and use_grid_ui:
             render_crossbar_checkbox_grid(grid_map, wp=wp, ns=ns)
@@ -1705,7 +2020,11 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
         relative_retention = bool(st.session_state.get(f"{wp}_relative_retention_{ns}", False)) if wp == "ret" else False
         plot_df = df
         selected_conductance = [col for col in plot_selected if is_conductance_column(col)]
-        y_label = "Conductance" if wp == "ret" and selected_conductance else "Resistance"
+        if wp == "pd":
+            plot_df = df_traces_to_conductance(df, plot_selected)
+            y_label = "Conductance (S)"
+        else:
+            y_label = "Conductance" if wp == "ret" and selected_conductance else "Resistance"
 
         if derive_resistance:
             plot_df = df.copy()
@@ -1725,8 +2044,9 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
         groups: dict[str, int] = {}
         group_color_map: dict[int, str] = {}
         show_group_summary = False
+        grouping_df = plot_df if wp == "pd" else df
         if color_close_starts:
-            groups = close_start_groups(df, plot_selected, threshold_percent=float(close_threshold))
+            groups = close_start_groups(grouping_df, plot_selected, threshold_percent=float(close_threshold))
             palette = qualitative.Plotly
             trace_color_map = {}
             for name in plot_selected:
@@ -1945,7 +2265,32 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
                 log_y=log_y_axis,
                 log_y_use_abs_y=cfg.log_y_use_abs_y,
             )
+        plan_df: pd.DataFrame | None = None
+        if wp == "pd" and color_close_starts and groups and plot_selected:
+            plan_df = _pd_pulse_planner_ui_and_markers(
+                fig,
+                raw_df=df,
+                plot_df=plot_df,
+                x_col=x_col,
+                plot_selected=plot_selected,
+                groups=groups,
+                group_color_map=group_color_map,
+                ns=ns,
+            )
         st.plotly_chart(fig, use_container_width=True)
+        if plan_df is not None and not plan_df.empty:
+            st.dataframe(plan_df, use_container_width=True, hide_index=True)
+            if plan_df["Recommended SET pulses"].isna().any():
+                st.warning(
+                    "Some targets fall outside the group-average conductance range and have no pulse recommendation."
+                )
+            st.download_button(
+                "Export retention plan as CSV",
+                data=plan_df.to_csv(index=False).encode("utf-8"),
+                file_name="pd_retention_plan.csv",
+                mime="text/csv",
+                key=f"pd_plan_export_{ns}",
+            )
         if log_y_axis:
             y_flat: list[float] = []
             for c in plot_selected:
@@ -1971,7 +2316,8 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
                 if gid is None:
                     continue
                 group_to_cols.setdefault(gid, []).append(col)
-            render_group_info(plot_df, x_col, group_to_cols, value_label=y_label, key=f"{wp}_{ns}")
+            info_label = "Conductance (S)" if wp == "pd" else y_label
+            render_group_info(plot_df, x_col, group_to_cols, value_label=info_label, key=f"{wp}_{ns}")
 
 
 # Dedicated keys so the combined view never collides with the standalone retention/IV modes
@@ -2789,18 +3135,27 @@ def main() -> None:
     with st.sidebar:
         mode = st.radio(
             "Measurement",
-            ["Resistance retention", "IV characteristics", "Retention \u2194 IV correlation"],
+            [
+                "Resistance retention",
+                "IV characteristics",
+                "Potential-Depression curve",
+                "Retention \u2194 IV correlation",
+            ],
             label_visibility="visible",
         )
         st.divider()
         if mode == "Retention \u2194 IV correlation":
             _correlation_sidebar_controls()
+        elif mode == "Potential-Depression curve":
+            _wide_csv_sidebar_controls(PD_VIEW)
         else:
             cfg = RETENTION_VIEW if mode == "Resistance retention" else IV_VIEW
             _wide_csv_sidebar_controls(cfg)
 
     if mode == "Retention \u2194 IV correlation":
         _retention_iv_correlation_main()
+    elif mode == "Potential-Depression curve":
+        _wide_csv_main_plot(PD_VIEW)
     else:
         cfg = RETENTION_VIEW if mode == "Resistance retention" else IV_VIEW
         _wide_csv_main_plot(cfg)
