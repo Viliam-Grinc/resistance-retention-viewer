@@ -491,6 +491,46 @@ def groups_from_pairwise_distances(
     return groups
 
 
+def _correlation_device_groups(
+    rows: list[dict[str, Any]],
+    iv_df: pd.DataFrame,
+    v_col: str,
+    *,
+    group_by: str,
+    threshold_percent: float,
+    iv_area_threshold: float,
+    cache_key: str,
+) -> tuple[dict[str, int], str, str, dict[str, float]]:
+    """Build device->group map for one correlation chart grouping basis."""
+    if group_by == "Retention start value":
+        basis_values = {
+            row["device"]: row["retention_start"] for row in rows if row["retention_start"] is not None
+        }
+        groups = close_value_groups(basis_values, threshold_percent=threshold_percent)
+        return groups, "retention start value", f"{threshold_percent:.0f}%", basis_values
+
+    corr_similarity_signature = (
+        st.session_state.get(CORR_IV_CSV_ID),
+        tuple(row["iv_col"] for row in rows),
+        str(v_col),
+        "sum",
+    )
+    cached = st.session_state.get(cache_key)
+    if isinstance(cached, dict) and cached.get("signature") == corr_similarity_signature:
+        devices = list(cached["devices"])
+        dist = np.array(cached["dist"], dtype=float)
+    else:
+        devices, dist = iv_pairwise_distance_matrix(rows, iv_df, iv_df[v_col], metric="sum")
+        st.session_state[cache_key] = {
+            "signature": corr_similarity_signature,
+            "devices": list(devices),
+            "dist": np.asarray(dist, dtype=float),
+        }
+    groups = groups_from_pairwise_distances(devices, dist, threshold=iv_area_threshold)
+    basis_values = {name: 0.0 for name in devices}
+    return groups, "IV curve similarity (sum)", f"{iv_area_threshold:.6g} A", basis_values
+
+
 def adjusted_rand_index(labels_a: list[int], labels_b: list[int]) -> float | None:
     """Adjusted Rand Index between two cluster labelings (contingency-table formula); ``None`` if undefined."""
     if len(labels_a) != len(labels_b) or not labels_a:
@@ -514,6 +554,391 @@ def adjusted_rand_index(labels_a: list[int], labels_b: list[int]) -> float | Non
         # Both labelings are trivial (single cluster each); treat perfect agreement as 1.0.
         return 1.0
     return (sum_comb_cells - expected) / (max_index - expected)
+
+
+def _greedy_match_ret_to_iv_groups(
+    rows: list[dict[str, Any]],
+    ret_groups: dict[str, int],
+    iv_groups: dict[str, int],
+) -> dict[int, int]:
+    """Map retention group IDs to IV group IDs by greedy maximum co-occurrence."""
+    contingency: dict[tuple[int, int], int] = {}
+    for row in rows:
+        ret_gid = ret_groups.get(row["device"])
+        iv_gid = iv_groups.get(row["device"])
+        if ret_gid is None or iv_gid is None:
+            continue
+        key = (ret_gid, iv_gid)
+        contingency[key] = contingency.get(key, 0) + 1
+    mapping: dict[int, int] = {}
+    ret_taken: set[int] = set()
+    iv_taken: set[int] = set()
+    for (ret_gid, iv_gid), _count in sorted(contingency.items(), key=lambda it: it[1], reverse=True):
+        if ret_gid in ret_taken or iv_gid in iv_taken:
+            continue
+        mapping[ret_gid] = iv_gid
+        ret_taken.add(ret_gid)
+        iv_taken.add(iv_gid)
+    return mapping
+
+
+def _group_contingency_dataframe(
+    rows: list[dict[str, Any]],
+    ret_groups: dict[str, int],
+    iv_groups: dict[str, int],
+) -> pd.DataFrame:
+    """Contingency table: retention group (rows) vs IV group (columns), cell counts."""
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        ret_gid = ret_groups.get(row["device"])
+        iv_gid = iv_groups.get(row["device"])
+        if ret_gid is None or iv_gid is None:
+            continue
+        records.append({"ret_group": ret_gid, "iv_group": iv_gid})
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    pivot = pd.crosstab(df["ret_group"], df["iv_group"])
+    pivot.index = [f"Ret G{int(i) + 1}" for i in pivot.index]
+    pivot.columns = [f"IV G{int(i) + 1}" for i in pivot.columns]
+    return pivot
+
+
+def _crossbar_group_heatmap_figure(
+    rows: list[dict[str, Any]],
+    groups: dict[str, int],
+    *,
+    title: str,
+) -> go.Figure:
+    """16×16 heatmap colored by group ID (x=row, y=column)."""
+    present_gids = sorted({groups[row["device"]] for row in rows if groups.get(row["device"]) is not None})
+    gid_to_idx = {gid: idx for idx, gid in enumerate(present_gids)}
+
+    z: list[list[float | None]] = [[None] * GRID_SIZE for _ in range(GRID_SIZE)]
+    text: list[list[str]] = [[""] * GRID_SIZE for _ in range(GRID_SIZE)]
+    for row in rows:
+        r, c = int(row["row"]), int(row["col"])
+        gid = groups.get(row["device"])
+        if gid is None:
+            z[c][r] = -1.0
+            text[c][r] = "ungrouped"
+        else:
+            z[c][r] = float(gid_to_idx[gid])
+            text[c][r] = f"G{gid + 1}"
+
+    colorscale: list[list[Any]] = [[0.0, _UNGROUPED_COLOR], [0.001, _UNGROUPED_COLOR]]
+    if present_gids:
+        n = len(present_gids)
+        span_start = 0.05
+        span_end = 1.0
+        for i, gid in enumerate(present_gids):
+            color = _group_palette_color(gid)
+            lo = span_start + (span_end - span_start) * (i / n)
+            hi = span_start + (span_end - span_start) * ((i + 1) / n)
+            colorscale.extend([[lo, color], [hi, color]])
+
+    fig = go.Figure(
+        go.Heatmap(
+            z=z,
+            x=list(range(GRID_SIZE)),
+            y=list(range(GRID_SIZE)),
+            text=text,
+            hovertemplate="row %{x}, col %{y}<br>%{text}<extra></extra>",
+            colorscale=colorscale,
+            zmin=-1,
+            zmax=max(len(present_gids) - 1, 0),
+            showscale=False,
+        )
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Row",
+        yaxis_title="Column",
+        height=520,
+        width=520,
+        yaxis={"scaleanchor": "x", "constrain": "domain"},
+    )
+    return fig
+
+
+def _crossbar_alignment_heatmap_figure(
+    rows: list[dict[str, Any]],
+    ret_groups: dict[str, int],
+    iv_groups: dict[str, int],
+    ret_to_iv: dict[int, int],
+) -> go.Figure:
+    """Crossbar map of retention-vs-IV group alignment per device."""
+    z: list[list[float | None]] = [[None] * GRID_SIZE for _ in range(GRID_SIZE)]
+    text: list[list[str]] = [[""] * GRID_SIZE for _ in range(GRID_SIZE)]
+    for row in rows:
+        r, c = int(row["row"]), int(row["col"])
+        ret_gid = ret_groups.get(row["device"])
+        iv_gid = iv_groups.get(row["device"])
+        if ret_gid is None or iv_gid is None:
+            z[c][r] = 0.0
+            text[c][r] = "ungrouped"
+        elif ret_to_iv.get(ret_gid) == iv_gid:
+            z[c][r] = 2.0
+            text[c][r] = f"aligned (R{ret_gid + 1}=IV{iv_gid + 1})"
+        else:
+            z[c][r] = 1.0
+            text[c][r] = f"mismatch (R{ret_gid + 1} vs IV{iv_gid + 1})"
+
+    colorscale = [
+        [0.0, "#bdbdbd"],
+        [0.34, "#bdbdbd"],
+        [0.34, "#e53935"],
+        [0.67, "#e53935"],
+        [0.67, "#43a047"],
+        [1.0, "#43a047"],
+    ]
+    fig = go.Figure(
+        go.Heatmap(
+            z=z,
+            x=list(range(GRID_SIZE)),
+            y=list(range(GRID_SIZE)),
+            text=text,
+            hovertemplate="row %{x}, col %{y}<br>%{text}<extra></extra>",
+            colorscale=colorscale,
+            zmin=0,
+            zmax=2,
+            showscale=False,
+        )
+    )
+    fig.update_layout(
+        title="Group alignment map (retention vs IV)",
+        xaxis_title="Row",
+        yaxis_title="Column",
+        height=520,
+        width=520,
+        yaxis={"scaleanchor": "x", "constrain": "domain"},
+    )
+    return fig
+
+
+def _iv_group_retention_group_table(
+    rows: list[dict[str, Any]],
+    iv_groups: dict[str, int],
+    ret_groups: dict[str, int],
+) -> pd.DataFrame:
+    """Per IV group: retention-group composition of its devices (label-based, not curve distance)."""
+    records: list[dict[str, Any]] = []
+    for iv_gid in sorted(set(iv_groups.values())):
+        members = [row for row in rows if iv_groups.get(row["device"]) == iv_gid]
+        n = len(members)
+        ret_labels: list[int | None] = [ret_groups.get(row["device"]) for row in members]
+        grouped = [g for g in ret_labels if g is not None]
+        counts: Counter[int | str] = Counter()
+        for g in ret_labels:
+            key: int | str = g if g is not None else "ungrouped"
+            counts[key] += 1
+
+        distinct = len([k for k in counts if k != "ungrouped"])
+        if grouped:
+            dominant_gid, dominant_n = Counter(grouped).most_common(1)[0]
+            purity = 100.0 * dominant_n / n
+            dominant_label = f"G{dominant_gid + 1}"
+        else:
+            purity = None
+            dominant_label = "—"
+
+        parts: list[str] = []
+        for key in sorted((k for k in counts if k != "ungrouped"), key=lambda k: int(k)):
+            parts.append(f"G{int(key) + 1}:{counts[key]}")
+        if counts.get("ungrouped", 0):
+            parts.append(f"ungrouped:{counts['ungrouped']}")
+
+        records.append(
+            {
+                "IV group": f"G{iv_gid + 1}",
+                "devices": n,
+                "distinct retention groups": distinct,
+                "dominant retention group": dominant_label,
+                "retention group purity (%)": None if purity is None else round(purity, 1),
+                "same retention group": "yes" if grouped and distinct == 1 and not counts.get("ungrouped") else "no",
+                "retention groups (counts)": ", ".join(parts) if parts else "—",
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _group_alignment_analysis_tab(
+    rows: list[dict[str, Any]],
+    ret_groups: dict[str, int],
+    iv_groups: dict[str, int],
+    *,
+    ret_group_by: str,
+    iv_group_by: str,
+) -> None:
+    """Crossbar maps and statistics for how well retention and IV groupings align."""
+    n = len(rows)
+    paired = [
+        row
+        for row in rows
+        if ret_groups.get(row["device"]) is not None and iv_groups.get(row["device"]) is not None
+    ]
+    ret_to_iv = _greedy_match_ret_to_iv_groups(rows, ret_groups, iv_groups)
+
+    n_aligned = 0
+    n_mismatch = 0
+    n_partial_ungrouped = 0
+    for row in rows:
+        ret_gid = ret_groups.get(row["device"])
+        iv_gid = iv_groups.get(row["device"])
+        if ret_gid is None or iv_gid is None:
+            n_partial_ungrouped += 1
+            continue
+        if ret_to_iv.get(ret_gid) == iv_gid:
+            n_aligned += 1
+        else:
+            n_mismatch += 1
+
+    labels_ret = [int(ret_groups[row["device"]]) for row in paired]
+    labels_iv = [int(iv_groups[row["device"]]) for row in paired]
+    ari = adjusted_rand_index(labels_ret, labels_iv) if len(paired) >= 2 else None
+    agreement_pct = (100.0 * n_aligned / len(paired)) if paired else None
+
+    st.caption(
+        f"Compares **{ret_group_by}** (retention chart) with **{iv_group_by}** (IV chart) on **{n}** matched devices."
+    )
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Paired (both grouped)", len(paired))
+    m2.metric("Aligned (matched groups)", n_aligned)
+    m3.metric("Mismatch", n_mismatch)
+    m4.metric(
+        "Alignment %",
+        None if agreement_pct is None else f"{agreement_pct:.1f}%",
+        help="Share of paired devices on matched retention/IV group labels (after greedy label matching).",
+    )
+    m5.metric("Adjusted Rand index", None if ari is None else round(ari, 3))
+    st.caption(
+        f"{n_partial_ungrouped} device(s) ungrouped on retention and/or IV (excluded from alignment % and ARI)."
+    )
+
+    map_left, map_right = st.columns(2)
+    with map_left:
+        st.plotly_chart(
+            _crossbar_group_heatmap_figure(
+                rows,
+                ret_groups,
+                title=f"Retention groups ({ret_group_by})",
+            ),
+            use_container_width=True,
+        )
+    with map_right:
+        st.plotly_chart(
+            _crossbar_group_heatmap_figure(
+                rows,
+                iv_groups,
+                title=f"IV groups ({iv_group_by})",
+            ),
+            use_container_width=True,
+        )
+
+    st.plotly_chart(
+        _crossbar_alignment_heatmap_figure(rows, ret_groups, iv_groups, ret_to_iv),
+        use_container_width=True,
+    )
+    st.caption("Gray = ungrouped on retention and/or IV; red = both grouped but different matched clusters; green = aligned.")
+
+    contingency = _group_contingency_dataframe(rows, ret_groups, iv_groups)
+    if contingency.empty:
+        st.warning("No devices are grouped on both retention and IV; contingency table is empty.")
+    else:
+        st.subheader("Group contingency (retention × IV)")
+        st.dataframe(contingency, use_container_width=True)
+        fig_ct = go.Figure(
+            go.Heatmap(
+                z=contingency.to_numpy(dtype=float),
+                x=list(contingency.columns),
+                y=list(contingency.index),
+                text=contingency.to_numpy(dtype=int),
+                texttemplate="%{text}",
+                hovertemplate="%{y} × %{x}: %{z} devices<extra></extra>",
+                colorscale="Blues",
+            )
+        )
+        fig_ct.update_layout(height=320 + 24 * len(contingency.index), margin={"l": 80, "r": 20, "t": 40, "b": 80})
+        st.plotly_chart(fig_ct, use_container_width=True)
+
+    ret_by_iv = _iv_group_retention_group_table(rows, iv_groups, ret_groups)
+    if ret_by_iv.empty:
+        st.info("No IV groups to summarize retention-group composition.")
+    else:
+        st.subheader("Retention groups within each IV group")
+        st.caption(
+            "For each IV cluster, lists the **retention group** assigned to every device (from the retention chart grouping). "
+            "**Purity** = share of devices in that IV group that share the same retention group. "
+            "This checks complementary retention labels per device, not curve sum-of-differences."
+        )
+        st.dataframe(ret_by_iv, use_container_width=True, hide_index=True)
+
+        detail_rows: list[dict[str, Any]] = []
+        for row in rows:
+            iv_gid = iv_groups.get(row["device"])
+            if iv_gid is None:
+                continue
+            ret_gid = ret_groups.get(row["device"])
+            detail_rows.append(
+                {
+                    "IV group": f"G{iv_gid + 1}",
+                    "device": row["device"],
+                    "row": row["row"],
+                    "col": row["col"],
+                    "retention group": "ungrouped" if ret_gid is None else f"G{ret_gid + 1}",
+                }
+            )
+        with st.expander("Per-device retention group inside each IV group"):
+            st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+
+    mapping_rows = [
+        {
+            "retention_group": f"G{ret_gid + 1}",
+            "matched_iv_group": f"G{iv_gid + 1}",
+            "devices_in_overlap": sum(
+                1
+                for row in rows
+                if ret_groups.get(row["device"]) == ret_gid and iv_groups.get(row["device"]) == iv_gid
+            ),
+        }
+        for ret_gid, iv_gid in sorted(ret_to_iv.items())
+    ]
+    if mapping_rows:
+        with st.expander("Greedy retention→IV group label matching"):
+            st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True, hide_index=True)
+
+    with st.expander("Per-device group assignment"):
+        show = pd.DataFrame(
+            [
+                {
+                    "device": row["device"],
+                    "row": row["row"],
+                    "col": row["col"],
+                    "ret_group": ret_groups.get(row["device"]),
+                    "iv_group": iv_groups.get(row["device"]),
+                }
+                for row in rows
+            ]
+        )
+        show["aligned"] = [
+            (
+                ret_groups.get(row["device"]) is not None
+                and iv_groups.get(row["device"]) is not None
+                and ret_to_iv.get(ret_groups[row["device"]]) == iv_groups[row["device"]]
+            )
+            for row in rows
+        ]
+        show["ret_group"] = show["ret_group"].map(lambda g: "ungrouped" if pd.isna(g) else int(g) + 1)
+        show["iv_group"] = show["iv_group"].map(lambda g: "ungrouped" if pd.isna(g) else int(g) + 1)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Export alignment table as CSV",
+            data=show.to_csv(index=False).encode("utf-8"),
+            file_name="group_alignment_devices.csv",
+            mime="text/csv",
+            key="corr_alignment_export",
+        )
 
 
 def is_conductance_column(column_name: str) -> bool:
@@ -983,7 +1408,6 @@ IV_VIEW = WideCsvViewConfig(
     log_y_use_abs_y=True,
 )
 
-
 def _x_axis_state_key(wp: str) -> str:
     return f"{wp}_x_axis_column"
 
@@ -1069,9 +1493,8 @@ def _wide_csv_sidebar_controls(cfg: WideCsvViewConfig) -> None:
             key=f"{wp}_derive_resistance_{chk_ns}",
             help="For conductance-like traces (e.g. G... or *(S)), plot derived resistance.",
         )
-
     x_col = str(st.session_state[xa_key])
-    y_cols = numeric_y_columns(df, x_col)
+    y_cols = numeric_y_columns(cfg, df, x_col)
     if not y_cols:
         st.warning("No plottable numeric series found (excluding the X column).")
         return
@@ -1257,7 +1680,10 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
         close_threshold = 10
         color_iv_similarity = False
         iv_area_threshold = 1e-3
-        if wp == "ret":
+        if wp == "pd":
+            color_close_starts = bool(st.session_state.get(f"{wp}_color_close_starts_{ns}", True))
+            close_threshold = int(st.session_state.get(f"{wp}_close_start_threshold_{ns}", 10))
+        elif wp == "ret":
             color_close_starts = st.toggle(
                 "Color traces by close start values",
                 value=False,
@@ -1310,9 +1736,10 @@ def _wide_csv_main_plot(cfg: WideCsvViewConfig) -> None:
                 group_color_map[gid] = palette[gid % len(palette)]
                 trace_color_map[name] = group_color_map[gid]
             if groups:
+                group_basis = "starting conductance" if wp == "pd" else "start values"
                 st.caption(f"Close-start groups: **{len(set(groups.values()))}** at threshold **{close_threshold}%**.")
                 st.caption(
-                    "Grouping formula: for starts `a` and `b`, "
+                    f"Grouping formula: for {group_basis} `a` and `b`, "
                     "`percent_diff = |a - b| / max(|a|, |b|, 1e-15) × 100`; "
                     "traces are grouped when adjacent sorted starts are within the threshold."
                 )
@@ -1604,11 +2031,19 @@ def _correlation_sidebar_controls() -> None:
     iv_cols = list(iv_df.columns)
     ret_cols = list(ret_df.columns)
 
+    st.subheader("Retention chart grouping")
     st.radio(
-        "Group devices by",
-        ["Retention", "IV read resistance", "IV curve similarity"],
-        key="corr_group_by",
-        help="The chosen measurement defines the groups; both charts are then colored by those groups.",
+        "Group retention chart by",
+        ["Retention start value", "IV curve similarity"],
+        key="corr_ret_group_by",
+        help="Grouping basis and colors for the retention chart only.",
+    )
+    st.subheader("IV chart grouping")
+    st.radio(
+        "Group IV chart by",
+        ["IV curve similarity", "Retention start value"],
+        key="corr_iv_group_by",
+        help="Grouping basis and colors for the IV characteristics chart only.",
     )
 
     v_guess = infer_voltage_column(iv_cols)
@@ -2009,7 +2444,8 @@ def _retention_iv_correlation_main() -> None:
     if ret_x_col not in ret_cols:
         ret_x_col = infer_x_column(ret_cols)
 
-    group_by = str(st.session_state.get("corr_group_by", "Retention"))
+    ret_group_by = str(st.session_state.get("corr_ret_group_by", "Retention start value"))
+    iv_group_by = str(st.session_state.get("corr_iv_group_by", "IV curve similarity"))
     polarity = str(st.session_state.get("corr_polarity", "positive"))
     read_mag = float(st.session_state.get("corr_read_mag", 0.2))
     read_voltage = read_mag if polarity == "positive" else -read_mag
@@ -2045,46 +2481,29 @@ def _retention_iv_correlation_main() -> None:
     )
     table = pd.DataFrame(rows)
 
-    # Group by the chosen measurement; devices missing that value are left ungrouped (gray).
-    if group_by == "Retention":
-        basis_values = {row["device"]: row["retention_start"] for row in rows if row["retention_start"] is not None}
-        basis_label = "retention start value"
-        groups = close_value_groups(basis_values, threshold_percent=threshold)
-        group_threshold_label = f"{threshold:.0f}%"
-    elif group_by == "IV read resistance":
-        basis_values = {row["device"]: row["iv_read_R"] for row in rows if row["iv_read_R"] is not None}
-        basis_label = f"IV read resistance at {read_voltage:+.3g} V"
-        groups = close_value_groups(basis_values, threshold_percent=threshold)
-        group_threshold_label = f"{threshold:.0f}%"
-    else:
-        basis_label = "IV curve similarity (area between curves)"
-        corr_similarity_signature = (
-            st.session_state.get(CORR_IV_CSV_ID),
-            tuple(row["iv_col"] for row in rows),
-            str(v_col),
-            "sum",
-        )
-        cached = st.session_state.get("corr_iv_similarity_cache")
-        if isinstance(cached, dict) and cached.get("signature") == corr_similarity_signature:
-            devices = list(cached["devices"])
-            dist = np.array(cached["dist"], dtype=float)
-        else:
-            devices, dist = iv_pairwise_distance_matrix(rows, iv_df, iv_df[v_col], metric="sum")
-            st.session_state["corr_iv_similarity_cache"] = {
-                "signature": corr_similarity_signature,
-                "devices": list(devices),
-                "dist": np.asarray(dist, dtype=float),
-            }
-        groups = groups_from_pairwise_distances(devices, dist, threshold=iv_area_threshold)
-        basis_values = {name: 0.0 for name in devices}
-        basis_label = "IV curve similarity (sum)"
-        group_threshold_label = f"{iv_area_threshold:.6g} A"
+    ret_groups, ret_basis_label, ret_threshold_label, ret_basis_values = _correlation_device_groups(
+        rows,
+        iv_df,
+        v_col,
+        group_by=ret_group_by,
+        threshold_percent=threshold,
+        iv_area_threshold=iv_area_threshold,
+        cache_key="corr_iv_similarity_cache",
+    )
+    iv_groups, iv_basis_label, iv_threshold_label, iv_basis_values = _correlation_device_groups(
+        rows,
+        iv_df,
+        v_col,
+        group_by=iv_group_by,
+        threshold_percent=threshold,
+        iv_area_threshold=iv_area_threshold,
+        cache_key="corr_iv_similarity_cache",
+    )
 
-    table["group"] = table["device"].map(lambda d: groups.get(d))
-    n_groups = len({g for g in groups.values()})
-    n_ungrouped = int(table["group"].isna().sum())
+    table["ret_group"] = table["device"].map(lambda d: ret_groups.get(d))
+    table["iv_group"] = table["device"].map(lambda d: iv_groups.get(d))
 
-    def _color_for(device: str) -> str:
+    def _color_for(groups: dict[str, int], device: str) -> str:
         gid = groups.get(device)
         return _UNGROUPED_COLOR if gid is None else _group_palette_color(gid)
 
@@ -2093,9 +2512,10 @@ def _retention_iv_correlation_main() -> None:
         f"(retention-only: {n_ret_only}; IV-only: {n_iv_only})."
     )
 
-    tab_grouped, tab_analysis = st.tabs(["Grouped charts", "Correlation analysis"])
+    tab_grouped, tab_analysis = st.tabs(["Grouped charts", "Group alignment"])
 
-    group_color_map = {gid: _group_palette_color(gid) for gid in sorted(set(groups.values()))}
+    ret_group_color_map = {gid: _group_palette_color(gid) for gid in sorted(set(ret_groups.values()))}
+    iv_group_color_map = {gid: _group_palette_color(gid) for gid in sorted(set(iv_groups.values()))}
     ret_conductance_cols = [row["ret_col"] for row in rows if is_conductance_column(row["ret_col"])]
     ret_y_label = "Conductance" if ret_conductance_cols else "Resistance"
 
@@ -2109,25 +2529,24 @@ def _retention_iv_correlation_main() -> None:
             ret_plot_df[col] = (1.0 / g).where(g != 0)
         ret_y_label = "Resistance"
 
-    # Group display + summary controls (mirrors the retention close-start group functionality).
-    ordered_gids = sorted(set(groups.values()))
-    group_counts = {gid: sum(1 for g in groups.values() if g == gid) for gid in ordered_gids}
-    group_labels = [f"Group {gid + 1} ({group_counts[gid]} devices)" for gid in ordered_gids]
-    label_to_gid = {label: gid for label, gid in zip(group_labels, ordered_gids, strict=False)}
-    ungrouped_label = f"Ungrouped ({n_ungrouped} devices)"
-    options = group_labels + ([ungrouped_label] if n_ungrouped else [])
+    def _group_options(groups: dict[str, int]) -> tuple[list[str], dict[str, int], str]:
+        ordered_gids = sorted(set(groups.values()))
+        group_counts = {gid: sum(1 for g in groups.values() if g == gid) for gid in ordered_gids}
+        group_labels = [f"Group {gid + 1} ({group_counts[gid]} devices)" for gid in ordered_gids]
+        label_to_gid = {label: gid for label, gid in zip(group_labels, ordered_gids, strict=False)}
+        n_ungrouped = sum(1 for row in rows if groups.get(row["device"]) is None)
+        ungrouped_label = f"Ungrouped ({n_ungrouped} devices)"
+        options = group_labels + ([ungrouped_label] if n_ungrouped else [])
+        return options, label_to_gid, ungrouped_label
 
-    with tab_analysis:
-        _correlation_analysis_tab(rows)
-
-    with tab_grouped:
-        st.caption(
-            f"Grouped **{len(basis_values)}** devices by **{basis_label}** "
-            f"into **{n_groups}** group(s) at threshold **{group_threshold_label}** "
-            f"(ungrouped/gray: {n_ungrouped})."
-        )
-
-        groups_key = "corr_show_groups"
+    def _filter_rows_for_chart(
+        groups: dict[str, int],
+        *,
+        groups_key: str,
+        browse_key: str,
+        browse_pick_key: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        options, label_to_gid, ungrouped_label = _group_options(groups)
         current = st.session_state.get(groups_key, options)
         valid = [g for g in current if g in options]
         if not valid:
@@ -2137,21 +2556,21 @@ def _retention_iv_correlation_main() -> None:
             "Show groups",
             options=options,
             key=groups_key,
-            help="Pick which groups (colors) to display on both charts.",
+            help="Pick which groups to display on this chart.",
         )
         picked_gids = {label_to_gid[label] for label in picked if label in label_to_gid}
         show_ungrouped = ungrouped_label in picked
         browse_on = st.toggle(
             "Browse one group at a time",
             value=False,
-            key="corr_browse_groups",
+            key=browse_key,
             help="Preview one group without changing the active Show groups selection.",
         )
         if browse_on:
             browse_pick = st.selectbox(
                 "Browse group",
                 options=options,
-                key="corr_browse_group_pick",
+                key=browse_pick_key,
             )
             if browse_pick == ungrouped_label:
                 picked_gids = set()
@@ -2160,25 +2579,38 @@ def _retention_iv_correlation_main() -> None:
                 gid = label_to_gid.get(browse_pick)
                 picked_gids = set() if gid is None else {gid}
                 show_ungrouped = False
-        show_group_summary = st.toggle(
-            "Show group average + min/max band",
-            value=(group_by == "IV curve similarity"),
-            key="corr_show_summary",
-            help="Per group, draw one average line and a light min-max band on both charts (ungrouped traces stay as lines).",
-        )
-
-        displayed_rows = [
+        displayed = [
             row
             for row in rows
             if (groups.get(row["device"]) in picked_gids)
             or (groups.get(row["device"]) is None and show_ungrouped)
         ]
-        grouped_rows = [row for row in displayed_rows if groups.get(row["device"]) is not None]
-        ungrouped_rows = [row for row in displayed_rows if groups.get(row["device"]) is None]
+        grouped = [row for row in displayed if groups.get(row["device"]) is not None]
+        ungrouped = [row for row in displayed if groups.get(row["device"]) is None]
+        return displayed, grouped, ungrouped
 
-        if not displayed_rows:
-            st.warning("No groups selected to display.")
-            return
+    with tab_analysis:
+        _group_alignment_analysis_tab(
+            rows,
+            ret_groups,
+            iv_groups,
+            ret_group_by=ret_group_by,
+            iv_group_by=iv_group_by,
+        )
+
+    with tab_grouped:
+        n_ret_groups = len(set(ret_groups.values()))
+        n_iv_groups = len(set(iv_groups.values()))
+        n_ret_ungrouped = sum(1 for row in rows if ret_groups.get(row["device"]) is None)
+        n_iv_ungrouped = sum(1 for row in rows if iv_groups.get(row["device"]) is None)
+        st.caption(
+            f"Retention chart: **{len(ret_basis_values)}** devices grouped by **{ret_basis_label}** "
+            f"into **{n_ret_groups}** group(s) at **{ret_threshold_label}** (ungrouped: {n_ret_ungrouped})."
+        )
+        st.caption(
+            f"IV chart: **{len(iv_basis_values)}** devices grouped by **{iv_basis_label}** "
+            f"into **{n_iv_groups}** group(s) at **{iv_threshold_label}** (ungrouped: {n_iv_ungrouped})."
+        )
 
         def _render_chart(
             *,
@@ -2188,6 +2620,12 @@ def _retention_iv_correlation_main() -> None:
             log_y: bool,
             y_label: str,
             use_abs_y: bool,
+            chart_groups: dict[str, int],
+            chart_color_map: dict[int, str],
+            displayed_rows: list[dict[str, Any]],
+            grouped_rows: list[dict[str, Any]],
+            ungrouped_rows: list[dict[str, Any]],
+            show_group_summary: bool,
         ) -> go.Figure:
             if show_group_summary:
                 base_cols = [row[col_key] for row in ungrouped_rows]
@@ -2201,14 +2639,14 @@ def _retention_iv_correlation_main() -> None:
                     trace_color_map={row[col_key]: _UNGROUPED_COLOR for row in ungrouped_rows},
                 )
                 grouped_cols = [row[col_key] for row in grouped_rows]
-                col_groups = {row[col_key]: groups[row["device"]] for row in grouped_rows}
+                col_groups = {row[col_key]: chart_groups[row["device"]] for row in grouped_rows}
                 add_group_summary_overlays(
                     fig,
                     df,
                     x_col,
                     grouped_cols,
                     col_groups,
-                    group_color_map,
+                    chart_color_map,
                     log_y=log_y,
                     log_y_use_abs_y=use_abs_y,
                 )
@@ -2221,60 +2659,119 @@ def _retention_iv_correlation_main() -> None:
                 log_y=log_y,
                 y_quantity_label=y_label,
                 log_y_use_abs_y=use_abs_y,
-                trace_color_map={row[col_key]: _color_for(row["device"]) for row in displayed_rows},
+                trace_color_map={
+                    row[col_key]: _color_for(chart_groups, row["device"]) for row in displayed_rows
+                },
             )
+
+        ret_displayed: list[dict[str, Any]] = []
+        ret_grouped: list[dict[str, Any]] = []
+        ret_ungrouped: list[dict[str, Any]] = []
+        iv_displayed: list[dict[str, Any]] = []
+        iv_grouped: list[dict[str, Any]] = []
+        iv_ungrouped: list[dict[str, Any]] = []
 
         left_col, right_col = st.columns(2)
         with left_col:
             st.subheader("Retention")
-            st.plotly_chart(
-                _render_chart(
-                    df=ret_plot_df,
-                    x_col=ret_x_col,
-                    col_key="ret_col",
-                    log_y=ret_log,
-                    y_label=ret_y_label,
-                    use_abs_y=False,
-                ),
-                use_container_width=True,
+            ret_displayed, ret_grouped, ret_ungrouped = _filter_rows_for_chart(
+                ret_groups,
+                groups_key="corr_ret_show_groups",
+                browse_key="corr_ret_browse_groups",
+                browse_pick_key="corr_ret_browse_group_pick",
             )
+            if not ret_displayed:
+                st.warning("No retention groups selected to display.")
+            else:
+                ret_show_summary = st.toggle(
+                    "Show group average + min/max band",
+                    value=(ret_group_by == "IV curve similarity"),
+                    key="corr_ret_show_summary",
+                )
+                st.plotly_chart(
+                    _render_chart(
+                        df=ret_plot_df,
+                        x_col=ret_x_col,
+                        col_key="ret_col",
+                        log_y=ret_log,
+                        y_label=ret_y_label,
+                        use_abs_y=False,
+                        chart_groups=ret_groups,
+                        chart_color_map=ret_group_color_map,
+                        displayed_rows=ret_displayed,
+                        grouped_rows=ret_grouped,
+                        ungrouped_rows=ret_ungrouped,
+                        show_group_summary=ret_show_summary,
+                    ),
+                    use_container_width=True,
+                )
+                st.caption(
+                    f"Colored by **{ret_group_by}** on the retention chart. "
+                    "Gray traces lack a usable grouping value."
+                )
         with right_col:
             st.subheader("IV characteristics")
-            st.plotly_chart(
-                _render_chart(
-                    df=iv_df,
-                    x_col=v_col,
-                    col_key="iv_col",
-                    log_y=iv_log,
-                    y_label="Current",
-                    use_abs_y=True,
-                ),
-                use_container_width=True,
+            iv_displayed, iv_grouped, iv_ungrouped = _filter_rows_for_chart(
+                iv_groups,
+                groups_key="corr_iv_show_groups",
+                browse_key="corr_iv_browse_groups",
+                browse_pick_key="corr_iv_browse_group_pick",
             )
+            if not iv_displayed:
+                st.warning("No IV groups selected to display.")
+            else:
+                iv_show_summary = st.toggle(
+                    "Show group average + min/max band",
+                    value=(iv_group_by == "IV curve similarity"),
+                    key="corr_iv_show_summary",
+                )
+                st.plotly_chart(
+                    _render_chart(
+                        df=iv_df,
+                        x_col=v_col,
+                        col_key="iv_col",
+                        log_y=iv_log,
+                        y_label="Current",
+                        use_abs_y=True,
+                        chart_groups=iv_groups,
+                        chart_color_map=iv_group_color_map,
+                        displayed_rows=iv_displayed,
+                        grouped_rows=iv_grouped,
+                        ungrouped_rows=iv_ungrouped,
+                        show_group_summary=iv_show_summary,
+                    ),
+                    use_container_width=True,
+                )
+                st.caption(
+                    f"Colored by **{iv_group_by}** on the IV chart. "
+                    "Gray traces lack a usable grouping value."
+                )
 
-        st.caption(
-            f"Both charts are colored by the **{group_by}** grouping (same color = same group). "
-            "Gray traces are devices without a usable grouping value."
-        )
+        if not ret_displayed and not iv_displayed:
+            return
 
         ret_group_to_cols: dict[int, list[str]] = {}
-        for row in grouped_rows:
-            ret_group_to_cols.setdefault(groups[row["device"]], []).append(row["ret_col"])
-        read_resistances = {row["ret_col"]: row["iv_read_R"] for row in grouped_rows if row["iv_read_R"] is not None}
-        render_group_info(
-            ret_plot_df,
-            ret_x_col,
-            ret_group_to_cols,
-            value_label=ret_y_label,
-            key="corr",
-            read_resistances=read_resistances,
-        )
+        for row in ret_grouped:
+            ret_group_to_cols.setdefault(ret_groups[row["device"]], []).append(row["ret_col"])
+        read_resistances = {row["ret_col"]: row["iv_read_R"] for row in ret_grouped if row["iv_read_R"] is not None}
+        if ret_group_to_cols:
+            render_group_info(
+                ret_plot_df,
+                ret_x_col,
+                ret_group_to_cols,
+                value_label=ret_y_label,
+                key="corr_ret",
+                read_resistances=read_resistances,
+            )
 
         with st.expander("Per-device groups and values"):
-            show = table[["device", "row", "col", "group", "retention_start", "iv_read_R"]].copy()
-            show["group"] = show["group"].map(lambda g: "ungrouped" if pd.isna(g) else int(g) + 1)
-            show["grouping_basis"] = group_by
-            show["grouping_threshold"] = group_threshold_label
+            show = table[["device", "row", "col", "retention_start", "iv_read_R", "ret_group", "iv_group"]].copy()
+            show["ret_group"] = show["ret_group"].map(lambda g: "ungrouped" if pd.isna(g) else int(g) + 1)
+            show["iv_group"] = show["iv_group"].map(lambda g: "ungrouped" if pd.isna(g) else int(g) + 1)
+            show["ret_grouping_basis"] = ret_group_by
+            show["ret_grouping_threshold"] = ret_threshold_label
+            show["iv_grouping_basis"] = iv_group_by
+            show["iv_grouping_threshold"] = iv_threshold_label
             st.dataframe(show, use_container_width=True)
             st.download_button(
                 "Export grouping table as CSV",
